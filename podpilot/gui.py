@@ -12,14 +12,15 @@ from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QRectF, QSettings,
                             QThread, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPalette, QPen,
                            QPixmap)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
-                               QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
-                               QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
-                               QProgressDialog, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStyle,
-                               QTableView, QToolBar, QToolButton, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
+                               QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+                               QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow,
+                               QMenu, QMessageBox, QProgressDialog, QPushButton, QSpinBox, QSplitter,
+                               QStackedWidget, QStyle, QTableView, QToolBar, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from . import __version__, media, updater
-from .device import IPod, app_data_dir, drive_signature, find_ipods, volume_label
+from .device import IPod, SyncPlan, app_data_dir, drive_signature, find_ipods, volume_label
 from .itunesdb import DatabaseError, Track, mac_to_datetime
 
 ACCENT = "#4f8cff"
@@ -174,7 +175,7 @@ class StorageBar(QWidget):
     def __init__(self):
         super().__init__()
         self.values = (0, 0, 0, 0)
-        self.setMinimumWidth(260)
+        self.setMinimumWidth(210)
         self.setFixedHeight(34)
 
     def set_values(self, total: int, used: int, free: int, music: int) -> None:
@@ -293,6 +294,93 @@ class EditDialog(QDialog):
         return changed
 
 
+class SyncDialog(QDialog):
+    """Preview of a folder sync: what would be added, updated and removed."""
+
+    MAX_LISTED = 500
+
+    def __init__(self, plan: SyncPlan, free_bytes: int, parent=None):
+        super().__init__(parent)
+        self.plan = plan
+        self.free_bytes = free_bytes
+        self.setWindowTitle("Sync from Folder")
+        self.setMinimumSize(620, 480)
+        lay = QVBoxLayout(self)
+        head = QLabel(f"Syncing from <b>{plan.folder}</b> and all its subfolders.")
+        head.setWordWrap(True)
+        lay.addWidget(head)
+
+        self.tree = QTreeWidget()
+        self.tree.setHeaderHidden(True)
+        self.tree.setUniformRowHeights(True)
+        rel = lambda path: str(path.relative_to(plan.folder))  # noqa: E731
+        song = lambda t: f"{t.artist} – {t.title}" if t.artist else t.title  # noqa: E731
+        self.group_add = self._group(f"New songs to copy ({fmt_size(plan.add_bytes)})",
+                                     [rel(p) for p, _ in plan.to_add])
+        self.group_update = self._group("Changed since the last sync", [rel(p) for p, _, _ in plan.to_update])
+        self.group_remove = self._group("On the iPod but not in this folder", [song(t) for t in plan.not_in_folder])
+        self._group("Already on the iPod", [rel(p) for p, _ in plan.unchanged + plan.linked])
+        self._group("Skipped: the same song appears twice in the folder", [rel(p) for p in plan.duplicates])
+        self._group("Couldn't be read", plan.errors)
+        lay.addWidget(self.tree, 1)
+
+        self.chk_update = QCheckBox("Update songs that changed since the last sync")
+        self.chk_update.setChecked(True)
+        self.chk_update.setEnabled(bool(plan.to_update))
+        self.chk_remove = QCheckBox("Remove songs from the iPod that aren't in this folder")
+        self.chk_remove.setEnabled(bool(plan.not_in_folder))
+        self.warning = QLabel()
+        self.warning.setStyleSheet("color: #ff8a80;")
+        self.space = QLabel()
+        for w in (self.chk_update, self.chk_remove, self.warning, self.space):
+            lay.addWidget(w)
+
+        self.buttons = QDialogButtonBox()
+        self.sync_btn = self.buttons.addButton("Sync", QDialogButtonBox.AcceptRole)
+        self.buttons.addButton(QDialogButtonBox.Cancel)
+        self.buttons.accepted.connect(self.accept)
+        self.buttons.rejected.connect(self.reject)
+        lay.addWidget(self.buttons)
+        self.chk_update.toggled.connect(self._refresh)
+        self.chk_remove.toggled.connect(self._refresh)
+        self._refresh()
+
+    def _group(self, title: str, lines: list[str]) -> QTreeWidgetItem:
+        item = QTreeWidgetItem([f"{title}: {len(lines)}"])
+        font = item.font(0)
+        font.setBold(bool(lines))
+        item.setFont(0, font)
+        for line in lines[:self.MAX_LISTED]:
+            QTreeWidgetItem(item, [line])
+        if len(lines) > self.MAX_LISTED:
+            QTreeWidgetItem(item, [f"… and {len(lines) - self.MAX_LISTED} more"])
+        if not lines:
+            item.setDisabled(True)
+        self.tree.addTopLevelItem(item)
+        return item
+
+    def options(self) -> tuple[bool, bool]:
+        return self.chk_update.isChecked(), self.chk_remove.isChecked()
+
+    def _refresh(self):
+        update, remove = self.options()
+        plan = self.plan
+        self.group_update.setDisabled(not (update and plan.to_update))
+        self.group_remove.setDisabled(not (remove and plan.not_in_folder))
+        n_remove = len(plan.not_in_folder)
+        self.warning.setText(f"{n_remove} song(s) will be deleted from the iPod." if remove and n_remove else "")
+        self.warning.setVisible(bool(remove and n_remove))
+        freed = sum(t.size for t in plan.not_in_folder) if remove else 0
+        needed = plan.add_bytes + (sum(p.stat().st_size for p, _, _ in plan.to_update) if update else 0)
+        short = needed > self.free_bytes + freed
+        self.space.setText(f"Needs about {fmt_size(needed)}  ·  {fmt_size(self.free_bytes + freed)} available"
+                           + ("  ·  not enough space, some songs will be skipped" if short else ""))
+        self.space.setStyleSheet("color: #ff8a80;" if short else "color: palette(placeholder-text);")
+        todo = plan.to_add or (update and plan.to_update) or (remove and plan.not_in_folder) or plan.linked
+        self.sync_btn.setEnabled(bool(todo))
+        self.sync_btn.setText("Sync" if todo else "Nothing to sync")
+
+
 class HealthDialog(QDialog):
     def __init__(self, report, writable=True, parent=None):
         super().__init__(parent)
@@ -404,26 +492,32 @@ class MainWindow(QMainWindow):
         self.addToolBar(tb)
 
         self.device_combo = QComboBox()
-        self.device_combo.setMinimumWidth(220)
+        self.device_combo.setMinimumWidth(190)
         self.device_combo.currentIndexChanged.connect(self._device_chosen)
         tb.addWidget(self.device_combo)
         self.act_refresh = self._action("Reload", self.reload_device, SP.SP_BrowserReload, "F5",
                                         "Re-read the iPod's database")
         tb.addAction(self.act_refresh)
+        tb.widgetForAction(self.act_refresh).setToolButtonStyle(Qt.ToolButtonIconOnly)
         tb.addSeparator()
 
-        self.act_add = self._action("Add Music", self.add_files, SP.SP_FileDialogNewFolder, "Ctrl+O",
+        self.act_add = self._action("Add", self.add_files, SP.SP_FileDialogNewFolder, "Ctrl+O",
                                     "Copy songs onto the iPod (or drag files onto the window)")
         self.act_add_folder = self._action("Add Folder…", self.add_folder, None, "Ctrl+Shift+O")
+        self.act_sync = self._action("Sync", self.sync_folder, SP.SP_DirLinkIcon, "Ctrl+Shift+S",
+                                     "Make the iPod match a music folder (including subfolders)")
         self.act_remove = self._action("Delete", self.remove_selected, SP.SP_TrashIcon, "Del",
                                        "Delete the selected songs from the iPod")
         self.act_export = self._action("Copy to PC", self.export_selected, SP.SP_DialogSaveButton, "Ctrl+E",
                                        "Copy the selected songs from the iPod to a folder")
-        self.act_edit = self._action("Edit Info", self.edit_selected, SP.SP_FileDialogDetailedView, "Ctrl+I")
-        self.act_playlist = self._action("Add to Playlist", self.show_playlist_menu, SP.SP_FileDialogListView)
-        self.act_health = self._action("Check Library", self.check_health, SP.SP_DialogApplyButton, None,
-                                       "Find stray files and broken entries")
-        for a in (self.act_add, self.act_remove, self.act_export, self.act_edit, self.act_playlist, self.act_health):
+        self.act_edit = self._action("Edit", self.edit_selected, SP.SP_FileDialogDetailedView, "Ctrl+I",
+                                     "Edit the selected songs' info")
+        self.act_playlist = self._action("Playlist", self.show_playlist_menu, SP.SP_FileDialogListView, None,
+                                         "Add the selected songs to a playlist")
+        self.act_health = self._action("Check", self.check_health, SP.SP_DialogApplyButton, None,
+                                       "Check the library for stray files and broken entries")
+        for a in (self.act_add, self.act_sync, self.act_remove, self.act_export, self.act_edit, self.act_playlist,
+                  self.act_health):
             tb.addAction(a)
 
         spacer = QWidget()
@@ -759,7 +853,7 @@ class MainWindow(QMainWindow):
         in_playlist = self._current_playlist() is not None
         for a in (self.act_health, self.act_eject, self.act_refresh):
             a.setEnabled(has_dev)
-        for a in (self.act_add, self.act_add_folder):
+        for a in (self.act_add, self.act_add_folder, self.act_sync):
             a.setEnabled(can_write)
         self.act_export.setEnabled(has_sel)
         for a in (self.act_remove, self.act_edit, self.act_playlist):
@@ -900,6 +994,46 @@ class MainWindow(QMainWindow):
             box.exec()
 
         self.run_job(f"Copying {len(files)} file(s) to {ipod.name}", job, done)
+
+    def sync_folder(self):
+        if not self.ipod or self.worker or not self.ipod.writable:
+            return
+        ipod = self.ipod
+        key = f"sync/folder/{ipod.label}"
+        start = self.settings.value(key) or ipod.load_manifest().get("folder") or ""
+        folder = QFileDialog.getExistingDirectory(self, "Sync the iPod with this folder", start)
+        if not folder:
+            return
+        self.settings.setValue(key, folder)
+
+        def planned(plan):
+            if plan is None:
+                return
+            dlg = SyncDialog(plan, ipod.storage()[2], self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            update, remove = dlg.options()
+            if remove and plan.not_in_folder and QMessageBox.question(
+                    self, "Sync from Folder",
+                    f"Delete {len(plan.not_in_folder)} song(s) from the iPod because they aren't in "
+                    f"{plan.folder}?") != QMessageBox.Yes:
+                return
+            self.run_job(f"Syncing from {plan.folder.name or plan.folder}",
+                         lambda p, c: ipod.apply_sync(plan, update, remove, p, c), synced)
+
+        def synced(result):
+            parts = [f"Added {result.added}", f"updated {result.updated}", f"removed {result.removed} song(s)."]
+            text = ", ".join(parts)
+            if result.cancelled:
+                text += "\n\nThe sync was cancelled partway; run it again to finish."
+            box = QMessageBox(QMessageBox.Warning if result.errors else QMessageBox.Information,
+                              "Sync from Folder", text, parent=self)
+            if result.errors:
+                box.setInformativeText(f"{len(result.errors)} file(s) had problems.")
+                box.setDetailedText("\n".join(result.errors))
+            box.exec()
+
+        self.run_job("Scanning the folder", lambda p, c: ipod.plan_sync(Path(folder), p, c), planned)
 
     def dragEnterEvent(self, event):
         if self.ipod and event.mimeData().hasUrls():

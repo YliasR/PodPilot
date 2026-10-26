@@ -6,6 +6,7 @@ A small desktop music manager for click-wheel iPods. Plug the iPod in, see what'
 
 - **Browse** everything on the iPod: title, artist, album, genre, length, plays, format, size, date added. Sort any column, search across all of them.
 - **Add music** by drag & drop, file picker or whole folders. MP3, AAC/M4A, ALAC, WAV and AIFF are copied as-is; FLAC, OGG, Opus, WMA etc. are converted to MP3 (V0) on the fly with ffmpeg. Duplicates are skipped.
+- **Sync from a folder**, including all subfolders. A preview shows what will be added, what changed since the last sync (updated in place, so songs keep their playlists) and what's on the iPod but not in the folder. Removing those is optional and off by default. Re-syncs are fast because PodPilot remembers which file became which song (`iPod_Control/PodPilot/sync.json`), and songs already on the iPod are matched by title, artist and length instead of being copied twice.
 - **Delete** songs (file and database entry, removed from every playlist).
 - **Playlists**: create, rename, delete, add/remove songs.
 - **Edit info** (title, artist, album, genre, year, track/disc numbers) for one or many songs.

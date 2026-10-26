@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import json
 import os
 import random
 import re
@@ -153,6 +154,29 @@ class ReadOnlyError(Exception):
 class AddResult:
     added: list[Track] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+
+
+@dataclass
+class SyncPlan:
+    """What syncing a folder would do. Built by IPod.plan_sync without touching the iPod."""
+    folder: Path
+    to_add: list[tuple[Path, dict]] = field(default_factory=list)
+    to_update: list[tuple[Path, Track, dict]] = field(default_factory=list)  # source changed since last sync
+    unchanged: list[tuple[Path, Track]] = field(default_factory=list)
+    linked: list[tuple[Path, Track]] = field(default_factory=list)  # already on the iPod, matched by tags
+    duplicates: list[Path] = field(default_factory=list)  # same song twice in the folder
+    not_in_folder: list[Track] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    add_bytes: int = 0
+
+
+@dataclass
+class SyncResult:
+    added: int = 0
+    updated: int = 0
+    removed: int = 0
+    cancelled: bool = False
     errors: list[str] = field(default_factory=list)
 
 
@@ -377,10 +401,15 @@ class IPod:
             shutil.rmtree(workdir, ignore_errors=True)
         return result
 
-    def _add_one(self, src: Path, workdir: Path, skip_duplicates: bool) -> Track | None:
-        meta = media.read_metadata(src)
+    def _add_one(self, src: Path, workdir: Path, skip_duplicates: bool, meta: dict | None = None) -> Track | None:
+        meta = meta or media.read_metadata(src)
         if skip_duplicates and self.find_duplicate(meta):
             return None
+        return self.db.add_track(self._upload(src, workdir, meta))
+
+    def _upload(self, src: Path, workdir: Path, meta: dict) -> dict:
+        """Converts `src` if needed and copies it into the music folders. Returns meta with location."""
+        meta = dict(meta)
         upload = src
         if media.needs_conversion(src, meta):
             upload = media.convert_to_mp3(src, workdir)
@@ -398,7 +427,148 @@ class IPod:
         meta["size"] = size
         meta["filetype_code"] = media.NATIVE[upload.suffix.lower()]
         meta["location"] = self._location_of(dest)
-        return self.db.add_track(meta)
+        return meta
+
+    # ---- folder sync
+
+    @property
+    def manifest_path(self) -> Path:
+        return self.control / "PodPilot" / "sync.json"
+
+    def load_manifest(self) -> dict:
+        """{'folder': str|None, 'files': {normalized source path: {dbid, size, mtime}}}, minus stale entries."""
+        try:
+            data = json.loads(self.manifest_path.read_text("utf-8"))
+            files = data.get("files", {}) if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            data, files = {}, {}
+        live = {f"{t.dbid:016x}" for t in self.db.tracks}
+        files = {k: v for k, v in files.items()
+                 if isinstance(v, dict) and v.get("dbid") in live}
+        return {"folder": data.get("folder") if isinstance(data, dict) else None, "files": files}
+
+    def save_manifest(self, manifest: dict) -> None:
+        self.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.manifest_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(manifest, indent=1, sort_keys=True), "utf-8")
+        os.replace(tmp, self.manifest_path)
+
+    @staticmethod
+    def _source_key(path: Path) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
+    @staticmethod
+    def _manifest_entry(track: Track, path: Path) -> dict:
+        st = path.stat()
+        return {"dbid": f"{track.dbid:016x}", "size": st.st_size, "mtime": round(st.st_mtime, 3)}
+
+    def plan_sync(self, folder: Path, progress: ProgressFn | None = None,
+                  cancelled: CancelFn | None = None) -> SyncPlan | None:
+        """Compares a folder (recursively) with the iPod. Changes nothing. None if cancelled."""
+        folder = Path(folder)
+        files = media.collect_audio_files([folder])
+        manifest = self.load_manifest()["files"]
+        by_dbid = {f"{t.dbid:016x}": t for t in self.db.tracks}
+        by_name: dict[tuple[str, str], list[Track]] = {}
+        for t in self.db.tracks:
+            by_name.setdefault((t.title.casefold(), t.artist.casefold()), []).append(t)
+
+        plan = SyncPlan(folder=folder)
+        claimed: set[int] = set()
+        pending: dict[tuple[str, str], list[int]] = {}
+        for i, src in enumerate(files):
+            if cancelled and cancelled():
+                return None
+            if progress:
+                progress(i, len(files), str(src.relative_to(folder)))
+            try:
+                st = src.stat()
+                entry = manifest.get(self._source_key(src))
+                track = by_dbid.get(entry["dbid"]) if entry else None
+                if track is not None and track.id not in claimed:
+                    claimed.add(track.id)
+                    if entry.get("size") == st.st_size and entry.get("mtime") == round(st.st_mtime, 3):
+                        plan.unchanged.append((src, track))
+                    else:
+                        plan.to_update.append((src, track, media.read_metadata(src)))
+                    continue
+
+                meta = media.read_metadata(src)
+                key = (meta["title"].casefold(), meta["artist"].casefold())
+                match = next((t for t in by_name.get(key, ())
+                              if t.id not in claimed and abs(t.length_ms - meta["length_ms"]) <= 2000), None)
+                if match is not None:
+                    claimed.add(match.id)
+                    plan.linked.append((src, match))
+                elif any(abs(n - meta["length_ms"]) <= 2000 for n in pending.get(key, ())):
+                    plan.duplicates.append(src)
+                else:
+                    pending.setdefault(key, []).append(meta["length_ms"])
+                    plan.to_add.append((src, meta))
+                    plan.add_bytes += st.st_size
+            except (media.MediaError, OSError) as exc:
+                plan.errors.append(f"{src.name}: {exc}")
+        plan.not_in_folder = [t for t in self.db.tracks if t.id not in claimed]
+        return plan
+
+    def apply_sync(self, plan: SyncPlan, update_changed: bool = True, remove_missing: bool = False,
+                   progress: ProgressFn | None = None, cancelled: CancelFn | None = None) -> SyncResult:
+        """Carries out a plan from plan_sync. Saves the database and the sync manifest."""
+        self.require_writable()
+        result = SyncResult()
+        manifest = self.load_manifest()
+        files = manifest["files"]
+        for src, track in plan.unchanged + plan.linked:
+            try:
+                files[self._source_key(src)] = self._manifest_entry(track, src)
+            except OSError:
+                pass
+
+        if remove_missing and plan.not_in_folder:
+            if progress:
+                progress(0, 1, "Removing songs that aren't in the folder")
+            result.errors += self.remove_tracks(plan.not_in_folder)
+            result.removed = len(plan.not_in_folder)
+
+        work = ([("update", item) for item in plan.to_update] if update_changed else []) + \
+               [("add", item) for item in plan.to_add]
+        replaced: list[Path] = []
+        workdir = Path(tempfile.mkdtemp(prefix="podpilot-sync-"))
+        try:
+            for i, (kind, item) in enumerate(work):
+                if cancelled and cancelled():
+                    result.cancelled = True
+                    break
+                src = item[0]
+                if progress:
+                    progress(i, len(work), str(src.relative_to(plan.folder)))
+                try:
+                    if kind == "add":
+                        track = self.db.add_track(self._upload(src, workdir, item[1]))
+                        result.added += 1
+                    else:
+                        track, meta = item[1], item[2]
+                        old = self.safe_path_of(track)
+                        self.db.apply_meta(track, self._upload(src, workdir, meta))
+                        if old is not None:
+                            replaced.append(old)  # deleted only once the new database is saved
+                        result.updated += 1
+                    files[self._source_key(src)] = self._manifest_entry(track, src)
+                except (media.MediaError, OSError) as exc:
+                    result.errors.append(f"{src.name}: {exc}")
+            if progress:
+                progress(len(work), len(work), "Writing database")
+            self.save()
+            manifest["folder"] = str(plan.folder)
+            self.save_manifest(manifest)
+            for old in replaced:
+                try:
+                    old.unlink(missing_ok=True)
+                except OSError as exc:
+                    result.errors.append(f"{old.name}: {exc}")
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+        return result
 
     # ---- removing / exporting
 

@@ -509,20 +509,41 @@ class ITunesDB:
 
     def add_track(self, meta: dict) -> Track:
         """Adds a track entry. `meta` must contain `location` (iPod-style, colon separated)."""
-        code = meta.get("filetype_code", "MP3 ")
-        desc, unk144 = FILETYPES.get(code, ("Audio file", 0x0C))
         now = mac_now()
         dbid = random.getrandbits(64)
-        sample_rate = int(meta.get("sample_rate") or 44100)
-
         chunk = Chunk(b"mhit", self._mhit_template(), [])
         t = Track(chunk)
         t.id = self._new_id()
         t.visible = 1
+        t.date_added = now
+        t.dbid = dbid
+        chunk.set("B", 0xA4, 2)        # no artwork
+        chunk.set("Q", 0xA8, dbid)
+        chunk.set("B", 0xB2, 2)        # not played yet
+        chunk.set("I", 0xD0, 1)        # media type: audio
+        self.apply_meta(t, meta)
+
+        self._list(DS_TRACKS).children.append(chunk)
+        self.tracks.append(t)
+        for master in self._masters():
+            self._append_mhip(master, t)
+        self.dirty = True
+        return t
+
+    def apply_meta(self, t: Track, meta: dict) -> None:
+        """Writes a file's tags and stream info into a track (new or existing).
+
+        Identity (id, dbid, date added), play history and playlist membership are left alone,
+        so updating a song whose source file changed keeps it in its playlists.
+        """
+        code = meta.get("filetype_code", "MP3 ")
+        desc, unk144 = FILETYPES.get(code, ("Audio file", 0x0C))
+        sample_rate = int(meta.get("sample_rate") or 44100)
+        chunk = t.chunk
         t.filetype_code = int.from_bytes(code.encode("latin-1"), "big")
         chunk.set("B", 0x1D, 1 if code == "MP3 " else 0)
         t.compilation = 1 if meta.get("compilation") else 0
-        t.time_modified = now
+        t.time_modified = mac_now()
         t.size = int(meta.get("size") or 0)
         t.length_ms = int(meta.get("length_ms") or 0)
         t.track_number = int(meta.get("track_number") or 0)
@@ -532,14 +553,8 @@ class ITunesDB:
         chunk.set("I", 0x3C, (sample_rate & 0xFFFF) << 16)
         t.disc_number = int(meta.get("disc_number") or 0)
         t.disc_count = int(meta.get("disc_count") or 0)
-        t.date_added = now
-        t.dbid = dbid
         chunk.set("f", 0x88, float(sample_rate))
         chunk.set("I", 0x90, unk144)
-        chunk.set("B", 0xA4, 2)        # no artwork
-        chunk.set("Q", 0xA8, dbid)
-        chunk.set("B", 0xB2, 2)        # not played yet
-        chunk.set("I", 0xD0, 1)        # media type: audio
 
         for mtype, key in ((MHOD_TITLE, "title"), (MHOD_ARTIST, "artist"), (MHOD_ALBUM, "album"),
                            (MHOD_ALBUM_ARTIST, "album_artist"), (MHOD_GENRE, "genre"),
@@ -547,13 +562,7 @@ class ITunesDB:
             t.set_string(mtype, meta.get(key) or "")
         t.set_string(MHOD_FILETYPE, desc)
         t.set_string(MHOD_LOCATION, meta["location"])
-
-        self._list(DS_TRACKS).children.append(chunk)
-        self.tracks.append(t)
-        for master in self._masters():
-            self._append_mhip(master, t)
         self.dirty = True
-        return t
 
     def _append_mhip(self, mhyp: Chunk, track: Track) -> None:
         position = 1
