@@ -104,6 +104,15 @@ class TrackModel(QAbstractTableModel):
         self.tracks = list(tracks)
         self.endResetModel()
 
+    def set_playing(self, track_id: int | None) -> None:
+        """Moves the ▶ marker. Only the affected title cells change, so emit dataChanged for those;
+        a bare layoutChanged corrupts the sort/filter proxy's mapping and crashes the view."""
+        old, self.playing_id = self.playing_id, track_id
+        for row, t in enumerate(self.tracks):
+            if t.id in (old, track_id):
+                cell = self.index(row, 0)
+                self.dataChanged.emit(cell, cell, [Qt.DisplayRole])
+
     def rowCount(self, parent=QModelIndex()):
         return 0 if parent.isValid() else len(self.tracks)
 
@@ -924,8 +933,17 @@ class MainWindow(QMainWindow):
                                 "and from every playlist.") != QMessageBox.Yes:
             return
         ipod = self.ipod
-        self.run_job("Deleting songs", lambda progress, _c: ipod.remove_tracks(tracks, progress),
-                     lambda errors: errors and QMessageBox.warning(self, "PodPilot", "\n".join(errors)))
+
+        def done(errors):
+            if not errors:
+                return
+            box = QMessageBox(QMessageBox.Warning, "PodPilot",
+                              f"The songs were removed from the library, but {len(errors)} file(s) couldn't be "
+                              "deleted from the iPod.\n\nRun Check Library to clean up the leftovers.", parent=self)
+            box.setDetailedText("\n".join(errors))
+            box.exec()
+
+        self.run_job("Deleting songs", lambda progress, _c: ipod.remove_tracks(tracks, progress), done)
 
     # ---- exporting / editing
 
@@ -1157,8 +1175,7 @@ class MainWindow(QMainWindow):
                 lambda s: self.stop_preview() if s == QMediaPlayer.MediaStatus.EndOfMedia else None)
         self.player.setSource(QUrl.fromLocalFile(str(path)))
         self.player.play()
-        self.model.playing_id = track.id
-        self.model.layoutChanged.emit()
+        self.model.set_playing(track.id)
         self.now_playing.setText(f"Playing: {track.artist} – {track.title}" if track.artist else f"Playing: {track.title}")
         self.stop_btn.show()
 
@@ -1166,8 +1183,7 @@ class MainWindow(QMainWindow):
         if self.player is not None:
             self.player.stop()
             self.player.setSource(QUrl())
-        self.model.playing_id = None
-        self.model.layoutChanged.emit()
+        self.model.set_playing(None)
         self.now_playing.clear()
         self.stop_btn.hide()
 

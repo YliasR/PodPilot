@@ -403,21 +403,37 @@ class IPod:
     # ---- removing / exporting
 
     def remove_tracks(self, tracks: list[Track], progress: ProgressFn | None = None) -> list[str]:
+        """Removes tracks from the database first, then deletes their files.
+
+        Saving first means a failure can never leave songs listed whose files are gone. A file
+        that can't be deleted (e.g. a USB hiccup) is just a stray the library check can remove.
+        """
         self.require_writable()
         errors = []
-        for i, t in enumerate(tracks):
-            if progress:
-                progress(i, len(tracks), t.title)
-            path = self.safe_path_of(t)
+        doomed: list[tuple[str, Path]] = []
+        for t in tracks:
+            try:
+                path = self.safe_path_of(t)
+            except OSError as exc:
+                errors.append(f"{t.title}: {exc}")
+                continue
             if path is None:
                 errors.append(f"{t.title}: location outside the music folder, file left alone")
-                continue
+            else:
+                doomed.append((t.title, path))
+
+        if progress:
+            progress(0, len(doomed), "Updating the iPod's library")
+        self.db.remove_tracks(t.id for t in tracks)
+        self.save()
+
+        for i, (title, path) in enumerate(doomed):
+            if progress:
+                progress(i, len(doomed), title)
             try:
                 path.unlink(missing_ok=True)
             except OSError as exc:
-                errors.append(f"{t.title}: {exc}")
-        self.db.remove_tracks(t.id for t in tracks)
-        self.save()
+                errors.append(f"{title}: {exc}")
         return errors
 
     def export_tracks(self, tracks: list[Track], dest: Path, progress: ProgressFn | None = None,
