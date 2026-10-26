@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "podpilot"
+version = "0.1.0"
+description = "Music manager for click-wheel iPods: add, browse, edit and remove songs without iTunes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["PySide6>=6.6", "mutagen>=1.47"]
+
+[project.gui-scripts]
+podpilot = "podpilot.gui:main"
+
+[tool.setuptools]
+packages = ["podpilot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
