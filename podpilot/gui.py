@@ -172,23 +172,39 @@ class TrackFilter(QSortFilterProxyModel):
 
 
 class StorageBar(QWidget):
+    """One-line capacity meter for the status bar: [bar] 1.2 GB music · 0.1 GB other · 0.5 GB free."""
+
+    BAR_WIDTH = 140
+
     def __init__(self):
         super().__init__()
         self.values = (0, 0, 0, 0)
-        self.setMinimumWidth(210)
-        self.setFixedHeight(34)
+        self.setFixedHeight(20)
+
+    def _text(self) -> str:
+        total, used, free, music = self.values
+        if not total:
+            return ""
+        return f"{fmt_size(music)} music  ·  {fmt_size(max(used - music, 0))} other  ·  {fmt_size(free)} free"
+
+    def sizeHint(self):
+        return QSize(self.BAR_WIDTH + 10 + self.fontMetrics().horizontalAdvance(self._text()) + 4, 20)
+
+    def minimumSizeHint(self):
+        return self.sizeHint()
 
     def set_values(self, total: int, used: int, free: int, music: int) -> None:
         self.values = (total, used, free, music)
         self.setToolTip(f"Music {fmt_size(music)}\nOther {fmt_size(max(used - music, 0))}\n"
                         f"Free {fmt_size(free)}\nCapacity {fmt_size(total)}")
+        self.updateGeometry()
         self.update()
 
     def paintEvent(self, _):
         total, used, free, music = self.values
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        bar = QRectF(0, 4, self.width(), 10)
+        bar = QRectF(0, (self.height() - 8) / 2, self.BAR_WIDTH, 8)
         p.setPen(Qt.NoPen)
         p.setBrush(QColor("#33363d"))
         p.drawRoundedRect(bar, 5, 5)
@@ -199,17 +215,14 @@ class StorageBar(QWidget):
             clip = QRectF(bar)
             p.setClipRect(QRectF(0, 0, music_w + other_w, self.height()))
             p.setBrush(QColor("#8a8f99"))
-            p.drawRoundedRect(clip, 5, 5)
+            p.drawRoundedRect(clip, 4, 4)
             p.setClipRect(QRectF(0, 0, music_w, self.height()))
             p.setBrush(QColor(ACCENT))
-            p.drawRoundedRect(clip, 5, 5)
+            p.drawRoundedRect(clip, 4, 4)
             p.restore()
         p.setPen(QPen(self.palette().color(QPalette.PlaceholderText)))
-        f = p.font()
-        f.setPointSizeF(f.pointSizeF() * 0.85)
-        p.setFont(f)
-        text = f"{fmt_size(music)} music  ·  {fmt_size(max(used - music, 0))} other  ·  {fmt_size(free)} free" if total else ""
-        p.drawText(QRectF(0, 16, self.width(), 18), Qt.AlignLeft | Qt.AlignVCenter, text)
+        p.drawText(QRectF(self.BAR_WIDTH + 10, 0, self.width() - self.BAR_WIDTH - 10, self.height()),
+                   Qt.AlignLeft | Qt.AlignVCenter, self._text())
 
 
 class Worker(QThread):
@@ -460,6 +473,7 @@ class MainWindow(QMainWindow):
         self.device_timer.start()
         QTimer.singleShot(0, self.scan_devices)
         self.settings = QSettings("PodPilot", "PodPilot")
+        self._restore_columns()
         self.pending_release: updater.Release | None = None
         QTimer.singleShot(1500, self.auto_check_updates)
 
@@ -498,7 +512,8 @@ class MainWindow(QMainWindow):
         self.act_refresh = self._action("Reload", self.reload_device, SP.SP_BrowserReload, "F5",
                                         "Re-read the iPod's database")
         tb.addAction(self.act_refresh)
-        tb.widgetForAction(self.act_refresh).setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self.act_eject = self._action("Eject", self.eject, SP.SP_ArrowUp, "Ctrl+J", "Safely eject the iPod")
+        tb.addAction(self.act_eject)
         tb.addSeparator()
 
         self.act_add = self._action("Add", self.add_files, SP.SP_FileDialogNewFolder, "Ctrl+O",
@@ -524,11 +539,6 @@ class MainWindow(QMainWindow):
         spacer.setSizePolicy(spacer.sizePolicy().horizontalPolicy().Expanding,
                              spacer.sizePolicy().verticalPolicy().Preferred)
         tb.addWidget(spacer)
-        self.storage = StorageBar()
-        tb.addWidget(self.storage)
-        tb.addSeparator()
-        self.act_eject = self._action("Eject", self.eject, SP.SP_ArrowUp, "Ctrl+J", "Safely eject the iPod")
-        tb.addAction(self.act_eject)
 
         menu = QMenu(self)
         menu.addAction("Check for Updates…", self.check_updates)
@@ -547,6 +557,57 @@ class MainWindow(QMainWindow):
         tb.addWidget(more)
 
         self._action("Search", lambda: self.search.setFocus(), None, "Ctrl+F")
+        self.toolbar = tb
+        self._toolbar_widths: tuple[int, int] | None = None
+        self._set_toolbar_style(Qt.ToolButtonTextBesideIcon)
+
+    def _set_toolbar_style(self, style) -> None:
+        self.toolbar.setToolButtonStyle(style)
+        # the toolbar pushes its style onto every button, so re-apply the icon-only one afterwards
+        self.toolbar.widgetForAction(self.act_refresh).setToolButtonStyle(Qt.ToolButtonIconOnly)
+
+    def _fit_toolbar(self) -> None:
+        """Shows button labels when they fit and falls back to icons (with tooltips) when they don't."""
+        if self._toolbar_widths is None:
+            widths = []
+            for style in (Qt.ToolButtonTextBesideIcon, Qt.ToolButtonIconOnly):
+                self._set_toolbar_style(style)
+                widths.append(self.toolbar.sizeHint().width())
+            self._toolbar_widths = (widths[0], widths[1])
+            self.setMinimumWidth(widths[1] + 24)
+        full, _compact = self._toolbar_widths
+        style = Qt.ToolButtonTextBesideIcon if self.width() >= full + 8 else Qt.ToolButtonIconOnly
+        if self.toolbar.toolButtonStyle() != style:
+            self._set_toolbar_style(style)
+
+    def _header_menu(self, pos):
+        """Right-click on the column header: choose which columns to show (Title always stays)."""
+        menu = QMenu(self)
+        for i, (name, _, _) in enumerate(COLUMNS[1:], start=1):
+            action = menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(not self.table.isColumnHidden(i))
+            action.toggled.connect(lambda on, i=i: self._set_column_visible(i, on))
+        menu.exec(self.table.horizontalHeader().viewport().mapToGlobal(pos))
+
+    def _set_column_visible(self, column: int, visible: bool) -> None:
+        self.table.setColumnHidden(column, not visible)
+        hidden = [COLUMNS[i][0] for i in range(1, len(COLUMNS)) if self.table.isColumnHidden(i)]
+        self.settings.setValue("view/hidden_columns", ",".join(hidden))
+
+    def _restore_columns(self) -> None:
+        hidden = set(str(self.settings.value("view/hidden_columns", "") or "").split(","))
+        for i, (name, _, _) in enumerate(COLUMNS[1:], start=1):
+            self.table.setColumnHidden(i, name in hidden)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._fit_toolbar()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._toolbar_widths is not None:
+            self._fit_toolbar()
 
     def _build_body(self):
         central = QWidget()
@@ -633,8 +694,13 @@ class MainWindow(QMainWindow):
         hh = self.table.horizontalHeader()
         hh.setHighlightSections(False)
         hh.setStretchLastSection(False)
-        for i, w in enumerate((250, 170, 190, 90, 36, 52, 48, 46, 92, 70, 84)):
+        hh.setContextMenuPolicy(Qt.CustomContextMenu)
+        hh.customContextMenuRequested.connect(self._header_menu)
+        for i, w in enumerate((250, 160, 170, 90, 36, 52, 48, 46, 84, 70, 84)):
             hh.resizeSection(i, w)
+        # Title takes whatever room is left, so the table only scrolls sideways when the other columns don't fit
+        hh.setSectionResizeMode(0, QHeaderView.Stretch)
+        hh.setMinimumSectionSize(40)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_menu)
         self.table.doubleClicked.connect(self.preview)
@@ -667,6 +733,8 @@ class MainWindow(QMainWindow):
         self.stop_btn.hide()
         self.stop_btn.clicked.connect(self.stop_preview)
         sb.addPermanentWidget(self.stop_btn)
+        self.storage = StorageBar()
+        sb.addPermanentWidget(self.storage)
 
     # ---- device handling
 
