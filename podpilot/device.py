@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import media
+from . import hash58, media
 from .itunesdb import ITunesDB, Track
 
 ProgressFn = Callable[[int, int, str], None]
@@ -66,8 +66,61 @@ def volume_label(root: Path) -> str:
     return root.name or str(root)
 
 
+def _guid_from_sysinfo(device_dir: Path) -> str | None:
+    """FireWire GUID from SysInfoExtended (plist) or SysInfo (key: value lines)."""
+    import plistlib
+    try:
+        ext = plistlib.loads((device_dir / "SysInfoExtended").read_bytes())
+        if isinstance(ext, dict) and ext.get("FireWireGUID"):
+            return str(ext["FireWireGUID"])
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        pass
+    try:
+        for line in (device_dir / "SysInfo").read_text("latin-1").splitlines():
+            key, _, value = line.partition(":")
+            if key.strip().lower() == "firewireguid" and value.strip():
+                return value.strip()
+    except OSError:
+        pass
+    return None
+
+
+def _guid_from_os(root: Path) -> str | None:
+    """The iPod reports its FireWire GUID as the USB serial number."""
+    try:
+        if os.name == "nt":
+            drive = str(root)[:2]
+            script = (f"$ld = Get-CimInstance Win32_LogicalDisk -Filter \"DeviceID='{drive}'\"; "
+                      "$p = Get-CimAssociatedInstance -InputObject $ld -ResultClassName Win32_DiskPartition; "
+                      "(Get-CimAssociatedInstance -InputObject $p -ResultClassName Win32_DiskDrive).PNPDeviceID")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True, text=True,
+                                 timeout=15, creationflags=subprocess.CREATE_NO_WINDOW).stdout
+        elif sys.platform.startswith("linux"):
+            out = ""
+            with open("/proc/mounts") as fh:
+                dev = next((line.split()[0] for line in fh if Path(line.split()[1]) == root), "")
+            block = Path("/sys/class/block") / Path(dev).name
+            node = block.resolve()
+            while node != node.parent:
+                serial = node / "serial"
+                if serial.is_file():
+                    out = serial.read_text()
+                    break
+                node = node.parent
+        else:
+            return None
+    except (OSError, subprocess.SubprocessError, StopIteration):
+        return None
+    match = re.search(r"(?<![0-9A-Fa-f])(000A27[0-9A-Fa-f]{10})(?![0-9A-Fa-f])", out)
+    return match.group(1) if match else None
+
+
 class UnsafeLocation(Exception):
     """A track location that points outside the iPod's music folder."""
+
+
+class ReadOnlyError(Exception):
+    """Raised when trying to change an iPod PodPilot can only read."""
 
 
 @dataclass
@@ -89,8 +142,41 @@ class IPod:
         self.control = self.root / "iPod_Control"
         self.itunes_dir = self.control / "iTunes"
         self.db_path = self.itunes_dir / "iTunesDB"
-        self.db = ITunesDB.load(self.db_path)
+        raw = self.db_path.read_bytes()
+        self.db = ITunesDB(raw)
+        self.guid: bytes | None = None
+        self.read_only_reason = self._check_signature(raw)
         self.play_counts_merged = self._merge_play_counts()
+
+    def _check_signature(self, raw: bytes) -> str | None:
+        """Works out whether we can write this iPod's database. Returns why not, or None."""
+        scheme = self.db.signature
+        if scheme == hash58.SCHEME_NONE:
+            return None
+        if scheme == hash58.SCHEME_HASH72:
+            return "This iPod (nano 5G or newer) signs its database with hash72, which PodPilot can't produce."
+        if scheme != hash58.SCHEME_HASH58:
+            return "This iPod uses a database signature PodPilot doesn't know."
+        text = _guid_from_sysinfo(self.control / "Device") or _guid_from_os(self.root)
+        if not text:
+            return "Couldn't find this iPod's FireWire ID, which is needed to sign its database."
+        try:
+            guid = hash58.parse_guid(text)
+        except hash58.Hash58Error as exc:
+            return str(exc)
+        # Only write if we can reproduce the signature iTunes left: proves the ID and algorithm match.
+        if not hash58.verify(raw, guid):
+            return "Couldn't reproduce this iPod's existing database signature, so changes are disabled to be safe."
+        self.guid = guid
+        return None
+
+    @property
+    def writable(self) -> bool:
+        return self.read_only_reason is None
+
+    def require_writable(self) -> None:
+        if not self.writable:
+            raise ReadOnlyError(self.read_only_reason)
 
     # ---- info
 
@@ -191,7 +277,12 @@ class IPod:
 
     def save(self) -> None:
         """Backs up the current database, then writes the new one atomically."""
+        self.require_writable()
         data = self.db.to_bytes()
+        if self.guid is not None:
+            data = hash58.sign(data, self.guid)
+            if not hash58.verify(data, self.guid):
+                raise hash58.Hash58Error("signature check failed after signing")
         ITunesDB(data)  # refuse to write anything we can't read back
         self.backup()
         tmp = self.db_path.with_name("iTunesDB.podpilot-tmp")
@@ -233,6 +324,7 @@ class IPod:
 
     def add_files(self, paths, progress: ProgressFn | None = None, cancelled: CancelFn | None = None,
                   skip_duplicates: bool = True) -> AddResult:
+        self.require_writable()
         files = media.collect_audio_files(paths)
         result = AddResult()
         workdir = Path(tempfile.mkdtemp(prefix="podpilot-"))
@@ -285,6 +377,7 @@ class IPod:
     # ---- removing / exporting
 
     def remove_tracks(self, tracks: list[Track], progress: ProgressFn | None = None) -> list[str]:
+        self.require_writable()
         errors = []
         for i, t in enumerate(tracks):
             if progress:
@@ -349,6 +442,7 @@ class IPod:
 
     def import_orphans(self, files: list[Path]) -> AddResult:
         """Registers audio files that are on the iPod but not in its database."""
+        self.require_writable()
         result = AddResult()
         for f in files:
             try:
@@ -365,10 +459,12 @@ class IPod:
         return result
 
     def delete_files(self, files: list[Path]) -> None:
+        self.require_writable()
         for f in files:
             f.unlink(missing_ok=True)
 
     def drop_missing(self, tracks: list[Track]) -> None:
+        self.require_writable()
         self.db.remove_tracks(t.id for t in tracks)
         self.save()
 

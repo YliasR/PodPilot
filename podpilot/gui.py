@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import sys
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -16,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
                                QTableView, QToolBar, QVBoxLayout, QWidget)
 
 from . import __version__, media
-from .device import IPod, find_ipods
+from .device import IPod, app_data_dir, find_ipods
 from .itunesdb import DatabaseError, Track, mac_to_datetime
 
 ACCENT = "#4f8cff"
@@ -276,7 +278,7 @@ class EditDialog(QDialog):
 
 
 class HealthDialog(QDialog):
-    def __init__(self, report, parent=None):
+    def __init__(self, report, writable=True, parent=None):
         super().__init__(parent)
         self.report = report
         self.choice = None
@@ -296,6 +298,8 @@ class HealthDialog(QDialog):
             imp.clicked.connect(lambda: self._pick("import"))
             dele = QPushButton("Delete these files")
             dele.clicked.connect(lambda: self._pick("delete"))
+            imp.setEnabled(writable)
+            dele.setEnabled(writable)
             row.addWidget(imp)
             row.addWidget(dele)
             row.addStretch()
@@ -309,6 +313,7 @@ class HealthDialog(QDialog):
             row = QHBoxLayout()
             drop = QPushButton("Remove these entries")
             drop.clicked.connect(lambda: self._pick("drop"))
+            drop.setEnabled(writable)
             row.addWidget(drop)
             row.addStretch()
             lay.addLayout(row)
@@ -421,7 +426,7 @@ class MainWindow(QMainWindow):
         self.empty_label.setStyleSheet("font-size: 18px; font-weight: 600;")
         lay.addWidget(self.empty_label)
         hint = QLabel("PodPilot finds it automatically once it shows up as a drive.\n"
-                      "Supports iPod classic (up to 5.5G), mini and nano (1st–2nd gen).")
+                      "Supports iPod classic, mini and nano (1st–4th gen).")
         hint.setAlignment(Qt.AlignCenter)
         hint.setStyleSheet("color: palette(placeholder-text);")
         lay.addWidget(hint)
@@ -439,9 +444,9 @@ class MainWindow(QMainWindow):
         side_lay = QVBoxLayout(side)
         side_lay.setContentsMargins(0, 0, 0, 0)
         side_lay.addWidget(self.sidebar)
-        new_pl = QPushButton("+  New Playlist")
-        new_pl.clicked.connect(self.new_playlist)
-        side_lay.addWidget(new_pl)
+        self.new_pl_btn = QPushButton("+  New Playlist")
+        self.new_pl_btn.clicked.connect(self.new_playlist)
+        side_lay.addWidget(self.new_pl_btn)
         splitter.addWidget(side)
 
         right = QWidget()
@@ -485,7 +490,13 @@ class MainWindow(QMainWindow):
         wrap = QWidget()
         wl = QVBoxLayout(wrap)
         wl.setContentsMargins(8, 8, 8, 0)
-        wl.addWidget(splitter)
+        self.readonly_banner = QLabel()
+        self.readonly_banner.setWordWrap(True)
+        self.readonly_banner.setStyleSheet("background: #3a2f12; color: #f2d28b; border: 1px solid #6b5520;"
+                                           "border-radius: 6px; padding: 8px 10px;")
+        self.readonly_banner.hide()
+        wl.addWidget(self.readonly_banner)
+        wl.addWidget(splitter, 1)
         self.stack.addWidget(wrap)
 
     def _build_statusbar(self):
@@ -540,6 +551,12 @@ class MainWindow(QMainWindow):
             return
         name = self.ipod.name
         self.device_combo.setItemText(self.device_combo.currentIndex(), f"{name}  ({root})")
+        if self.ipod.writable:
+            self.readonly_banner.hide()
+        else:
+            self.readonly_banner.setText(f"<b>Read-only.</b> {self.ipod.read_only_reason} "
+                                         "You can browse and copy songs to your PC, but not change anything.")
+            self.readonly_banner.show()
         self.stack.setCurrentIndex(1)
         self.current_playlist_id = self.LIBRARY
         self.refresh_view()
@@ -658,11 +675,16 @@ class MainWindow(QMainWindow):
     def _update_actions(self):
         has_dev = self.ipod is not None and self.worker is None
         has_sel = has_dev and bool(self.table.selectionModel().selectedRows())
+        can_write = has_dev and self.ipod.writable
         in_playlist = self._current_playlist() is not None
-        for a in (self.act_add, self.act_add_folder, self.act_health, self.act_eject, self.act_refresh):
+        for a in (self.act_health, self.act_eject, self.act_refresh):
             a.setEnabled(has_dev)
-        for a in (self.act_remove, self.act_export, self.act_edit, self.act_playlist):
-            a.setEnabled(has_sel)
+        for a in (self.act_add, self.act_add_folder):
+            a.setEnabled(can_write)
+        self.act_export.setEnabled(has_sel)
+        for a in (self.act_remove, self.act_edit, self.act_playlist):
+            a.setEnabled(has_sel and can_write)
+        self.new_pl_btn.setEnabled(can_write)
         self.act_remove.setText("Remove from Playlist" if in_playlist else "Delete")
         self.act_remove.setToolTip("Remove the selected songs from this playlist (they stay on the iPod)"
                                    if in_playlist else "Delete the selected songs from the iPod")
@@ -676,10 +698,13 @@ class MainWindow(QMainWindow):
         m.addAction("Play Preview", lambda: self.preview(self.table.currentIndex()))
         m.addSeparator()
         m.addAction(self.act_edit)
-        m.addMenu(self._playlist_menu())
+        if self.ipod.writable:
+            m.addMenu(self._playlist_menu())
         m.addAction(self.act_export)
         m.addSeparator()
-        if self._current_playlist() is not None:
+        if not self.ipod.writable:
+            pass
+        elif self._current_playlist() is not None:
             m.addAction("Remove from Playlist", self.remove_selected)
             m.addAction("Delete from iPod…", self.delete_selected)
         else:
@@ -688,6 +713,8 @@ class MainWindow(QMainWindow):
 
     def _sidebar_menu(self, pos):
         item = self.sidebar.itemAt(pos)
+        if not self.ipod or not self.ipod.writable:
+            return
         m = QMenu(self)
         m.addAction("New Playlist…", self.new_playlist)
         if item is not None and item.data(Qt.UserRole) not in (None, "header"):
@@ -760,7 +787,7 @@ class MainWindow(QMainWindow):
             self.import_paths([folder])
 
     def import_paths(self, paths):
-        if not self.ipod or self.worker:
+        if not self.ipod or self.worker or not self.ipod.writable:
             return
         files = media.collect_audio_files(paths)
         if not files:
@@ -914,7 +941,7 @@ class MainWindow(QMainWindow):
         ipod = self.ipod
 
         def done(report):
-            dlg = HealthDialog(report, self)
+            dlg = HealthDialog(report, ipod.writable, self)
             if dlg.exec() != QDialog.Accepted:
                 return
             if dlg.choice == "import":
@@ -1013,12 +1040,55 @@ def apply_theme(app: QApplication) -> None:
     """)
 
 
+class StallWatchdog(threading.Thread):
+    """Debug aid: logs what the UI thread is doing whenever it stops responding."""
+
+    def __init__(self, log_path: Path, threshold: float = 0.4):
+        super().__init__(daemon=True)
+        self.log_path = log_path
+        self.threshold = threshold
+        self.beat = time.monotonic()
+        self.main_id = threading.main_thread().ident
+        self.timer = QTimer(interval=50, timeout=self._tick)
+        self.timer.start()
+
+    def _tick(self):
+        self.beat = time.monotonic()
+
+    def run(self):
+        stall_start = None
+        last_sample = 0.0
+        while True:
+            time.sleep(0.1)
+            now = time.monotonic()
+            lag = now - self.beat
+            if lag > self.threshold:
+                if stall_start is None:
+                    stall_start = self.beat
+                if now - last_sample >= 1.0:
+                    last_sample = now
+                    frame = sys._current_frames().get(self.main_id)
+                    stack = "".join(traceback.format_stack(frame)) if frame else "(no frame)\n"
+                    self._write(f"--- stalled {lag:.2f}s so far\n{stack}")
+            elif stall_start is not None:
+                self._write(f"=== stall ended after {self.beat - stall_start:.2f}s\n\n")
+                stall_start, last_sample = None, 0.0
+
+    def _write(self, text: str):
+        with open(self.log_path, "a", encoding="utf-8") as fh:
+            fh.write(f"[{time.strftime('%H:%M:%S')}] {text}")
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("PodPilot")
     app.setApplicationVersion(__version__)
     app.setWindowIcon(app_icon())
     apply_theme(app)
+    if "--debug" in sys.argv:
+        log = app_data_dir() / "debug.log"
+        log.parent.mkdir(parents=True, exist_ok=True)
+        StallWatchdog(log).start()
     win = MainWindow()
     win.show()
     return app.exec()

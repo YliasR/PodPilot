@@ -95,11 +95,14 @@ def test_playlists():
     assert not [p for p in ITunesDB(db.to_bytes()).playlists if p.editable]
 
 
-def test_rejects_hashed_database():
+def test_detects_signature_scheme():
+    from podpilot import hash58
     raw = bytearray(empty_db_bytes())
+    assert ITunesDB(bytes(raw)).signature == hash58.SCHEME_NONE
     raw[0x58] = 1
-    with pytest.raises(DatabaseError):
-        ITunesDB(bytes(raw))
+    assert ITunesDB(bytes(raw)).signature == hash58.SCHEME_HASH58
+    raw[0x80] = 1
+    assert ITunesDB(bytes(raw)).signature == hash58.SCHEME_HASH72
 
 
 def test_malformed_input_raises_database_error():

@@ -17,13 +17,14 @@ A small desktop music manager for click-wheel iPods. Plug the iPod in, see what'
 
 ## Supported devices
 
-iPods that use an unsigned iTunesDB:
+| iPod | Database | PodPilot |
+|---|---|---|
+| classic 1G–5.5G (incl. video), mini, nano 1G–2G | unsigned | Full support |
+| classic 6G/6.5G/7G, nano 3G–4G | signed with **hash58** | Full support (experimental) |
+| nano 5G | signed with hash72 | Read-only: browse and copy to PC |
+| nano 6G/7G, shuffle, touch | hashAB / other formats | Not supported |
 
-| Works | Doesn't work (signed database) |
-|---|---|
-| iPod classic 1G–5.5G (incl. video), mini, nano 1G–2G | nano 3G+, classic 6G/7G, shuffle, touch |
-
-> The nano 3G/4G and classic 6G+ need a device-specific hash in the database. PodPilot detects this and refuses to write rather than corrupting anything.
+**How hash58 support stays safe:** the signature is keyed with the iPod's FireWire GUID, which PodPilot reads from `SysInfoExtended`/`SysInfo` or from the USB serial number. When an iPod is opened, PodPilot first recomputes the signature iTunes left on the existing database. Writing is only enabled if it matches exactly, which proves both the GUID and the algorithm are right for that device. If it doesn't match, the iPod opens read-only. hash58 support is ported from [libgpod](https://sourceforge.net/projects/gtkpod/) and hasn't been tested on every model yet, so reports are welcome.
 
 ## Install & run
 
@@ -42,6 +43,7 @@ On Windows you can also double-click `PodPilot.bat`. For converting non-native f
 - The new database is written to a temp file, read back to verify it, and then swapped in.
 - Unknown parts of the database are preserved byte-for-byte. Loading and saving an unchanged library reproduces the original file exactly, including the browse indices.
 - If you still sync the iPod with iTunes/Apple Music, it may overwrite changes made here. Pick one manager.
+- A hash58 iPod that has never been synced with iTunes has no signature to check against yet, so PodPilot treats it as unsigned. Sync it with iTunes once first.
 
 ## How it works
 
@@ -54,6 +56,8 @@ pip install pytest
 python -m pytest
 ```
 
+If the UI hangs, run `python -m podpilot --debug`: every stall longer than 0.4 s is logged with a stack trace to `%APPDATA%\PodPilot\debug.log`.
+
 ## License
 
-MIT
+MIT. `podpilot/hash58.py` is a port of libgpod code and keeps its BSD license notice.

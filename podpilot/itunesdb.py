@@ -1,4 +1,4 @@
-"""Reader/writer for the iTunesDB used by click-wheel iPods (classic 1G-5.5G, mini, nano 1G-2G).
+"""Reader/writer for the iTunesDB used by click-wheel iPods (classic, mini, nano 1G-4G).
 
 The database is a tree of chunks. Every chunk starts with a 4-byte magic and a
 header length; most also store a total length (header + children), while list
@@ -8,7 +8,8 @@ The parser keeps every header byte-for-byte and leaves unknown chunks untouched,
 loading and saving an unmodified database reproduces the original file exactly.
 Only the fields we understand are ever rewritten.
 
-Nano 3G+ and classic 6G+ use a signed database (hash58/hash72), which is not supported.
+Nano 3G/4G and classic 6G+ sign the database (hash58, see hash58.py); signing happens on
+save in device.py. Later schemes (hash72, hashAB) can be read but not written.
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import datetime as _dt
 import random
 import struct
 import unicodedata
+
+from . import hash58
 
 MAC_EPOCH = _dt.datetime(1904, 1, 1)
 
@@ -417,8 +420,7 @@ class ITunesDB:
             raise DatabaseError(f"corrupt database: {exc}") from exc
         if end != len(data):
             raise DatabaseError("trailing data after database")
-        if any(self.root.header[0x58:0x6C]) or any(self.root.header[0x72:0xA0]):
-            raise DatabaseError("this iPod uses a signed (hashed) database, which is not supported")
+        self.signature = hash58.scheme_of(data)
         if self._list(DS_TRACKS) is None:
             raise DatabaseError("database has no track list")
         self.tracks = [Track(c) for c in self._list(DS_TRACKS).children]
