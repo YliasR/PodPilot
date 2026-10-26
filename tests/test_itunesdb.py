@@ -100,3 +100,34 @@ def test_rejects_hashed_database():
     raw[0x58] = 1
     with pytest.raises(DatabaseError):
         ITunesDB(bytes(raw))
+
+
+def test_malformed_input_raises_database_error():
+    raw = bytearray(empty_db_bytes())
+    for bad in (raw[:20], raw[:-4], bytes(raw[:4]) + b"\x00" * 8 + bytes(raw[12:])):
+        with pytest.raises(DatabaseError):
+            ITunesDB(bytes(bad))
+    zero_header = bytearray(raw)
+    struct.pack_into("<I", zero_header, 244 + 4, 0)  # first mhsd header length = 0
+    with pytest.raises(DatabaseError):
+        ITunesDB(bytes(zero_header))
+
+
+def test_track_locations_cannot_escape_music_folder(tmp_path, monkeypatch):
+    from podpilot import device
+    from podpilot.device import IPod
+    monkeypatch.setattr(device, "app_data_dir", lambda: tmp_path / "appdata")
+    itunes = tmp_path / "iPod_Control" / "iTunes"
+    (tmp_path / "iPod_Control" / "Music" / "F00").mkdir(parents=True)
+    itunes.mkdir(parents=True)
+    victim = tmp_path / "victim.txt"
+    victim.write_text("keep me")
+    db = ITunesDB(empty_db_bytes())
+    for loc in (":iPod_Control:Music:..:..:victim.txt", ":victim.txt", r":iPod_Control:Music:F00:..\..\..\victim.txt"):
+        db.add_track(dict(track_meta("Evil"), location=loc))
+    (itunes / "iTunesDB").write_bytes(db.to_bytes())
+
+    ipod = IPod(tmp_path)
+    assert all(ipod.safe_path_of(t) is None for t in ipod.db.tracks)
+    errors = ipod.remove_tracks(list(ipod.db.tracks))
+    assert len(errors) == 3 and victim.read_text() == "keep me"

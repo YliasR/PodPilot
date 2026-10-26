@@ -936,8 +936,8 @@ class MainWindow(QMainWindow):
             return
         from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
         track = self.model.tracks[self.proxy.mapToSource(index).row()]
-        path = self.ipod.path_of(track)
-        if not path.is_file():
+        path = self.ipod.safe_path_of(track)
+        if path is None or not path.is_file():
             QMessageBox.warning(self, "PodPilot", "That song's file is missing from the iPod.")
             return
         if self.player is None:

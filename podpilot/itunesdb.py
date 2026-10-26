@@ -123,18 +123,29 @@ def _u32(data, offset: int) -> int:
     return struct.unpack_from("<I", data, offset)[0]
 
 
-def parse_chunk(data: bytes, offset: int) -> tuple[Chunk, int]:
+MAX_DEPTH = 8
+
+
+def parse_chunk(data: bytes, offset: int, depth: int = 0) -> tuple[Chunk, int]:
     magic = bytes(data[offset:offset + 4])
     if len(magic) != 4 or not magic.startswith(b"mh"):
         raise DatabaseError(f"bad chunk magic {magic!r} at {offset:#x}")
+    if depth > MAX_DEPTH or offset + 12 > len(data):
+        raise DatabaseError(f"malformed chunk {magic!r} at {offset:#x}")
     header_len = _u32(data, offset + 4)
+    # every chunk consumes at least 12 bytes, so the loops below always advance
+    if header_len < 12 or offset + header_len > len(data):
+        raise DatabaseError(f"chunk {magic!r} at {offset:#x} has a bad header length")
     header = bytearray(data[offset:offset + header_len])
 
     if magic in LISTS:
         pos = offset + header_len
+        count = _u32(data, offset + 8)
+        if count > (len(data) - pos) // 12:
+            raise DatabaseError(f"list {magic!r} at {offset:#x} claims too many children")
         children = []
-        for _ in range(_u32(data, offset + 8)):
-            child, pos = parse_chunk(data, pos)
+        for _ in range(count):
+            child, pos = parse_chunk(data, pos, depth + 1)
             children.append(child)
         return Chunk(magic, header, children), pos
 
@@ -146,7 +157,7 @@ def parse_chunk(data: bytes, offset: int) -> tuple[Chunk, int]:
     if magic in CONTAINERS and not (magic == b"mhsd" and data[pos:pos + 4] not in LISTS):
         children = []
         while pos < end:
-            child, pos = parse_chunk(data, pos)
+            child, pos = parse_chunk(data, pos, depth + 1)
             children.append(child)
         if pos != end:
             raise DatabaseError(f"children of {magic!r} at {offset:#x} overrun it")
@@ -400,11 +411,16 @@ class ITunesDB:
     def __init__(self, data: bytes):
         if data[:4] != b"mhbd":
             raise DatabaseError("not an iTunesDB file")
-        self.root, end = parse_chunk(data, 0)
+        try:
+            self.root, end = parse_chunk(data, 0)
+        except (struct.error, IndexError) as exc:
+            raise DatabaseError(f"corrupt database: {exc}") from exc
         if end != len(data):
             raise DatabaseError("trailing data after database")
         if any(self.root.header[0x58:0x6C]) or any(self.root.header[0x72:0xA0]):
             raise DatabaseError("this iPod uses a signed (hashed) database, which is not supported")
+        if self._list(DS_TRACKS) is None:
+            raise DatabaseError("database has no track list")
         self.tracks = [Track(c) for c in self._list(DS_TRACKS).children]
         self.dirty = False
         self._next_id = max([t.id for t in self.tracks] + self._mhip_ids() + [100]) + 1

@@ -66,6 +66,10 @@ def volume_label(root: Path) -> str:
     return root.name or str(root)
 
 
+class UnsafeLocation(Exception):
+    """A track location that points outside the iPod's music folder."""
+
+
 @dataclass
 class AddResult:
     added: list[Track] = field(default_factory=list)
@@ -105,11 +109,28 @@ class IPod:
         return usage.total, usage.used, usage.free, music
 
     def path_of(self, track: Track) -> Path:
+        """Resolves a track's location, refusing anything outside iPod_Control/Music.
+
+        The location comes from the device, so it's treated as untrusted: a crafted
+        database must not be able to point deletes or copies at host files.
+        """
         parts = [p for p in track.location.split(":") if p]
-        return self.root.joinpath(*parts)
+        if not parts or any(p in (".", "..") or "/" in p or "\\" in p or os.path.isabs(p) for p in parts):
+            raise UnsafeLocation(track.location)
+        music = (self.control / "Music").resolve()
+        path = self.root.joinpath(*parts).resolve()
+        if not path.is_relative_to(music):
+            raise UnsafeLocation(track.location)
+        return path
+
+    def safe_path_of(self, track: Track) -> Path | None:
+        try:
+            return self.path_of(track)
+        except UnsafeLocation:
+            return None
 
     def _location_of(self, path: Path) -> str:
-        rel = path.relative_to(self.root)
+        rel = path.resolve().relative_to(self.root.resolve())
         return ":" + ":".join(rel.parts)
 
     # ---- play counts written by the iPod since the last sync
@@ -122,7 +143,7 @@ class IPod:
         if data[:4] != b"mhdp" or len(data) < 16:
             return False
         header_len, entry_len, count = struct.unpack_from("<III", data, 4)
-        if count != len(self.db.tracks) or entry_len < 12:
+        if count != len(self.db.tracks) or entry_len < 12 or header_len + count * entry_len > len(data):
             return False
         for i, track in enumerate(self.db.tracks):
             off = header_len + i * entry_len
@@ -150,7 +171,7 @@ class IPod:
     # ---- saving
 
     def backup_dir(self) -> Path:
-        safe = re.sub(r"[^\w.-]+", "_", self.label or "iPod").strip("_") or "iPod"
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", self.label or "iPod").strip("_-") or "iPod"
         return app_data_dir() / "backups" / safe
 
     def backup(self) -> Path:
@@ -268,8 +289,12 @@ class IPod:
         for i, t in enumerate(tracks):
             if progress:
                 progress(i, len(tracks), t.title)
+            path = self.safe_path_of(t)
+            if path is None:
+                errors.append(f"{t.title}: location outside the music folder, file left alone")
+                continue
             try:
-                self.path_of(t).unlink(missing_ok=True)
+                path.unlink(missing_ok=True)
             except OSError as exc:
                 errors.append(f"{t.title}: {exc}")
         self.db.remove_tracks(t.id for t in tracks)
@@ -289,10 +314,14 @@ class IPod:
                 break
             if progress:
                 progress(i, len(tracks), t.title)
-            src = self.path_of(t)
+            src = self.safe_path_of(t)
+            if src is None:
+                errors.append(f"{t.title}: location outside the music folder, skipped")
+                continue
+            suffix = src.suffix.lower() if src.suffix.lower() in media.AUDIO_EXTENSIONS else ".mp3"
             folder = dest / clean(t.album_artist or t.artist or "Unknown Artist") / clean(t.album or "Unknown Album")
             prefix = f"{t.track_number:02d} " if t.track_number else ""
-            target = folder / f"{prefix}{clean(t.title or src.stem)}{src.suffix.lower()}"
+            target = folder / f"{prefix}{clean(t.title or src.stem)}{suffix}"
             try:
                 folder.mkdir(parents=True, exist_ok=True)
                 n = 2
@@ -307,14 +336,15 @@ class IPod:
     # ---- health check
 
     def health(self) -> HealthReport:
-        known = {os.path.normcase(str(self.path_of(t))) for t in self.db.tracks}
-        music = self.control / "Music"
+        paths = {t.id: self.safe_path_of(t) for t in self.db.tracks}
+        known = {os.path.normcase(str(p)) for p in paths.values() if p}
+        music = (self.control / "Music").resolve()
         orphans = []
         if music.is_dir():
             for f in music.rglob("*"):
                 if f.is_file() and f.suffix.lower() in media.AUDIO_EXTENSIONS and os.path.normcase(str(f)) not in known:
                     orphans.append(f)
-        missing = [t for t in self.db.tracks if not self.path_of(t).is_file()]
+        missing = [t for t in self.db.tracks if paths[t.id] is None or not paths[t.id].is_file()]
         return HealthReport(sorted(orphans), missing)
 
     def import_orphans(self, files: list[Path]) -> AddResult:
