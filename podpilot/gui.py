@@ -8,16 +8,17 @@ import time
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QRectF, QSize, QSortFilterProxyModel, Qt,
+from PySide6.QtCore import (QAbstractTableModel, QModelIndex, QRectF, QSettings, QSize, QSortFilterProxyModel, Qt,
                             QThread, QTimer, QUrl, Signal)
-from PySide6.QtGui import QAction, QColor, QIcon, QKeySequence, QPainter, QPalette, QPen, QPixmap
+from PySide6.QtGui import (QAction, QColor, QDesktopServices, QIcon, QKeySequence, QPainter, QPalette, QPen,
+                           QPixmap)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDialog, QDialogButtonBox,
                                QFileDialog, QFormLayout, QHBoxLayout, QHeaderView, QInputDialog, QLabel,
                                QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox,
                                QProgressDialog, QPushButton, QSpinBox, QSplitter, QStackedWidget, QStyle,
-                               QTableView, QToolBar, QVBoxLayout, QWidget)
+                               QTableView, QToolBar, QToolButton, QVBoxLayout, QWidget)
 
-from . import __version__, media
+from . import __version__, media, updater
 from .device import IPod, app_data_dir, drive_signature, find_ipods, volume_label
 from .itunesdb import DatabaseError, Track, mac_to_datetime
 
@@ -48,10 +49,16 @@ def fmt_date(mac_ts: int) -> str:
 
 
 def app_icon() -> QIcon:
-    pm = QPixmap(64, 64)
+    return QIcon(icon_pixmap(64))
+
+
+def icon_pixmap(size: int) -> QPixmap:
+    """The app icon, drawn on a 64-unit grid and scaled to `size` pixels."""
+    pm = QPixmap(size, size)
     pm.fill(Qt.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.Antialiasing)
+    p.scale(size / 64, size / 64)
     p.setPen(Qt.NoPen)
     p.setBrush(QColor("#e8e8ec"))
     p.drawRoundedRect(QRectF(14, 2, 36, 60), 8, 8)
@@ -64,7 +71,7 @@ def app_icon() -> QIcon:
     p.setBrush(QColor("#e8e8ec"))
     p.drawEllipse(QRectF(27, 39, 10, 10))
     p.end()
-    return QIcon(pm)
+    return pm
 
 
 # --------------------------------------------------------------------------- track table
@@ -355,6 +362,9 @@ class MainWindow(QMainWindow):
         self.device_timer = QTimer(self, interval=2000, timeout=self._poll_drives)
         self.device_timer.start()
         QTimer.singleShot(0, self.scan_devices)
+        self.settings = QSettings("PodPilot", "PodPilot")
+        self.pending_release: updater.Release | None = None
+        QTimer.singleShot(1500, self.auto_check_updates)
 
     def _start_thread(self, worker: Worker) -> None:
         # keep a reference until the thread has really stopped; Qt aborts if a running QThread is collected
@@ -417,11 +427,46 @@ class MainWindow(QMainWindow):
         self.act_eject = self._action("Eject", self.eject, SP.SP_ArrowUp, "Ctrl+J", "Safely eject the iPod")
         tb.addAction(self.act_eject)
 
+        menu = QMenu(self)
+        menu.addAction("Check for Updates…", self.check_updates)
+        self.act_auto_update = menu.addAction("Check for Updates Automatically")
+        self.act_auto_update.setCheckable(True)
+        self.act_auto_update.toggled.connect(lambda on: self.settings.setValue("updates/auto_check", on))
+        menu.addSeparator()
+        menu.addAction("Open Backups Folder", lambda: self._open_folder(app_data_dir() / "backups"))
+        menu.addAction("About PodPilot", self.show_about)
+        more = QToolButton()
+        more.setText("☰")
+        more.setToolTip("More")
+        more.setPopupMode(QToolButton.InstantPopup)
+        more.setMenu(menu)
+        more.setStyleSheet("QToolButton::menu-indicator { image: none; }")
+        tb.addWidget(more)
+
         self._action("Search", lambda: self.search.setFocus(), None, "Ctrl+F")
 
     def _build_body(self):
+        central = QWidget()
+        cl = QVBoxLayout(central)
+        cl.setContentsMargins(0, 0, 0, 0)
+        cl.setSpacing(0)
+        self.update_bar = QWidget()
+        self.update_bar.setObjectName("updateBar")
+        self.update_bar.setStyleSheet("#updateBar { background: #1d2b45; border-bottom: 1px solid #2c4470; }")
+        ub = QHBoxLayout(self.update_bar)
+        ub.setContentsMargins(12, 6, 8, 6)
+        self.update_label = QLabel()
+        ub.addWidget(self.update_label, 1)
+        for text, slot in (("Update Now", self.install_update), ("What's New", self.show_release_notes),
+                           ("Skip This Version", self.skip_update), ("✕", lambda: self.update_bar.hide())):
+            b = QPushButton(text)
+            b.clicked.connect(slot)
+            ub.addWidget(b)
+        self.update_bar.hide()
+        cl.addWidget(self.update_bar)
         self.stack = QStackedWidget()
-        self.setCentralWidget(self.stack)
+        cl.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
 
         empty = QWidget()
         lay = QVBoxLayout(empty)
@@ -982,6 +1027,117 @@ class MainWindow(QMainWindow):
 
         self.run_job("Checking the library", lambda p, c: ipod.health(), done)
 
+    # ---- updates
+
+    def auto_check_updates(self):
+        self.act_auto_update.blockSignals(True)
+        enabled = self.settings.value("updates/auto_check", True, type=bool)
+        self.act_auto_update.setChecked(enabled)
+        self.act_auto_update.blockSignals(False)
+        last = self.settings.value("updates/last_check", 0.0, type=float)
+        if enabled and updater.can_self_update() and time.time() - last > 24 * 3600:
+            self._fetch_release(interactive=False)
+
+    def check_updates(self):
+        self._fetch_release(interactive=True)
+
+    def _fetch_release(self, interactive: bool):
+        worker = Worker(lambda _p, _c: updater.fetch_latest())
+
+        def done(release):
+            self.settings.setValue("updates/last_check", time.time())
+            newer = release is not None and updater.is_newer(release.version)
+            if newer and (interactive or self.settings.value("updates/skipped") != release.version):
+                self.pending_release = release
+                self.update_label.setText(f"<b>PodPilot {release.version}</b> is available "
+                                          f"(you have {__version__}).")
+                self.update_bar.show()
+                if interactive:
+                    self.install_update()
+            elif interactive:
+                QMessageBox.information(self, "PodPilot", f"You're up to date (version {__version__}).")
+
+        def failed(message):
+            if interactive:
+                QMessageBox.warning(self, "PodPilot", f"Couldn't check for updates.\n\n{message}")
+
+        worker.done.connect(done)
+        worker.failed.connect(failed)
+        self._start_thread(worker)
+
+    def show_release_notes(self):
+        if self.pending_release:
+            QDesktopServices.openUrl(QUrl(self.pending_release.page_url))
+
+    def skip_update(self):
+        if self.pending_release:
+            self.settings.setValue("updates/skipped", self.pending_release.version)
+        self.update_bar.hide()
+
+    def install_update(self):
+        release = self.pending_release
+        if release is None:
+            return
+        if not updater.can_self_update():
+            box = QMessageBox(QMessageBox.Information, "PodPilot",
+                              f"PodPilot {release.version} is out. You're running from source, so update with "
+                              "git pull, or grab the installer from the releases page.", parent=self)
+            open_btn = box.addButton("Open Releases Page", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Close)
+            box.exec()
+            if box.clickedButton() is open_btn:
+                self.show_release_notes()
+            return
+        if self.worker is not None:
+            QMessageBox.information(self, "PodPilot", "Wait for the current task to finish first.")
+            return
+        notes = release.notes[:1200] or "No release notes."
+        if QMessageBox.question(self, "Update PodPilot",
+                                f"Install PodPilot {release.version} now?\n\nPodPilot will close, update and "
+                                f"reopen.\n\n{notes}") != QMessageBox.Yes:
+            return
+
+        dlg = QProgressDialog(f"Downloading PodPilot {release.version}…", "Cancel", 0, 0, self)
+        dlg.setWindowTitle("PodPilot")
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setMinimumWidth(420)
+        worker = Worker(lambda progress, cancelled: updater.download_installer(release, progress, cancelled))
+        dlg.canceled.connect(lambda: setattr(worker, "cancel_requested", True))
+
+        def progress(done, total, text):
+            dlg.setMaximum(max(total, 1))
+            dlg.setValue(min(done, total))
+            dlg.setLabelText(f"Downloading PodPilot {release.version}…\n{text}")
+
+        def done(path):
+            dlg.reset()
+            if path is None:
+                return
+            self.stop_preview()
+            updater.launch_installer(path)
+            QApplication.quit()
+
+        def failed(message):
+            dlg.reset()
+            QMessageBox.critical(self, "PodPilot", f"The update couldn't be installed.\n\n{message}")
+
+        worker.progress.connect(progress)
+        worker.done.connect(done)
+        worker.failed.connect(failed)
+        self._start_thread(worker)
+
+    def show_about(self):
+        QMessageBox.about(self, "About PodPilot",
+                          f"<h3>PodPilot {__version__}</h3>"
+                          "<p>A music manager for click-wheel iPods.</p>"
+                          f"<p><a href='https://github.com/{updater.REPO}'>github.com/{updater.REPO}</a></p>"
+                          "<p>MIT licensed. hash58 support ported from libgpod (BSD).</p>")
+
+    def _open_folder(self, path: Path):
+        path.mkdir(parents=True, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
     # ---- preview playback
 
     def preview(self, index):
@@ -1100,7 +1256,20 @@ class StallWatchdog(threading.Thread):
             fh.write(f"[{time.strftime('%H:%M:%S')}] {text}")
 
 
+def selftest() -> int:
+    """Smoke test for packaged builds: Qt starts and the audio backend can decode MP3/AAC."""
+    from PySide6.QtMultimedia import QMediaFormat
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+    fmt = QMediaFormat()
+    decodable = fmt.supportedFileFormats(QMediaFormat.ConversionMode.Decode)
+    ok = QMediaFormat.FileFormat.MP3 in decodable and QMediaFormat.FileFormat.Mpeg4Audio in decodable
+    MainWindow().deleteLater()
+    return 0 if ok else 1
+
+
 def main() -> int:
+    if "--selftest" in sys.argv:
+        return selftest()
     app = QApplication(sys.argv)
     app.setApplicationName("PodPilot")
     app.setApplicationVersion(__version__)

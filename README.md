@@ -26,7 +26,17 @@ A small desktop music manager for click-wheel iPods. Plug the iPod in, see what'
 
 **How hash58 support stays safe:** the signature is keyed with the iPod's FireWire GUID, which PodPilot reads from `SysInfoExtended`/`SysInfo` or from the USB serial number. When an iPod is opened, PodPilot first recomputes the signature iTunes left on the existing database. Writing is only enabled if it matches exactly, which proves both the GUID and the algorithm are right for that device. If it doesn't match, the iPod opens read-only. hash58 support is ported from [libgpod](https://sourceforge.net/projects/gtkpod/) and hasn't been tested on every model yet, so reports are welcome.
 
-## Install & run
+## Download
+
+Grab `PodPilot-Setup-x.y.z.exe` from the [latest release](https://github.com/YliasR/PodPilot/releases/latest) and run it. It installs for your user only (no admin prompt) and adds a Start menu entry.
+
+PodPilot checks for updates once a day (turn this off under ☰ → *Check for Updates Automatically*). Updates are downloaded from GitHub, verified against the release's `SHA256SUMS.txt`, and installed in the background, and then PodPilot reopens.
+
+The installer isn't code-signed, so Windows SmartScreen may warn the first time. Click *More info → Run anyway*.
+
+For converting FLAC/OGG/Opus etc., install [ffmpeg](https://ffmpeg.org/) and make sure it's on `PATH` (`winget install Gyan.FFmpeg`).
+
+## Run from source
 
 Requires Python 3.10+.
 
@@ -34,8 +44,6 @@ Requires Python 3.10+.
 pip install -r requirements.txt
 python -m podpilot
 ```
-
-On Windows you can also double-click `PodPilot.bat`. For converting non-native formats, install [ffmpeg](https://ffmpeg.org/) and make sure it's on `PATH`.
 
 ## Safety
 
@@ -55,6 +63,26 @@ On Windows you can also double-click `PodPilot.bat`. For converting non-native f
 pip install pytest
 python -m pytest
 ```
+
+### Building the installer
+
+```bash
+pip install pyinstaller
+winget install JRSoftware.InnoSetup
+```
+
+Then run `./build.ps1`. It writes `dist/PodPilot/PodPilot.exe`, `dist/PodPilot-Setup-<version>.exe` and `dist/SHA256SUMS.txt`. `PodPilot.exe --selftest` checks that the packaged build starts and can decode audio.
+
+### Releasing
+
+Bump `__version__` in `podpilot/__init__.py` (and `pyproject.toml`), commit, then push a matching tag:
+
+```bash
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+The release workflow tests, builds and self-tests the exe, then publishes the GitHub release that the in-app updater picks up.
 
 If the UI hangs, run `python -m podpilot --debug`: every stall longer than 0.4 s is logged with a stack trace to `%APPDATA%\PodPilot\debug.log`.
 

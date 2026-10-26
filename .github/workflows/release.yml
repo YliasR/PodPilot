@@ -1,0 +1,67 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt pyinstaller pytest
+
+      - name: Check tag matches version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $v = (Select-String podpilot/__init__.py -Pattern '__version__ = "([^"]+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne $env:TAG) { throw "Tag $env:TAG doesn't match podpilot.__version__ ($v)" }
+
+      - name: Test
+        run: python -m pytest -q
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build exe and installer
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Self-test the frozen build
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process dist/PodPilot/PodPilot.exe -ArgumentList "--selftest" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "PodPilot.exe --selftest failed ($($p.ExitCode))" }
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $setup = (Get-Item dist/PodPilot-Setup-*.exe).FullName
+          gh release create $env:TAG $setup dist/SHA256SUMS.txt --title "PodPilot $env:TAG" --generate-notes
+
+      - name: Upload build artifacts
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PodPilot-windows
+          path: |
+            dist/PodPilot-Setup-*.exe
+            dist/SHA256SUMS.txt
