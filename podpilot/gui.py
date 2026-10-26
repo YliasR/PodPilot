@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QDial
                                QTableView, QToolBar, QVBoxLayout, QWidget)
 
 from . import __version__, media
-from .device import IPod, app_data_dir, find_ipods
+from .device import IPod, app_data_dir, drive_signature, find_ipods, volume_label
 from .itunesdb import DatabaseError, Track, mac_to_datetime
 
 ACCENT = "#4f8cff"
@@ -349,9 +349,18 @@ class MainWindow(QMainWindow):
         self._build_statusbar()
         self._update_actions()
 
-        self.device_timer = QTimer(self, interval=3000, timeout=self.scan_devices)
+        self.scanner: Worker | None = None
+        self._threads: set[Worker] = set()
+        self._drive_sig = None
+        self.device_timer = QTimer(self, interval=2000, timeout=self._poll_drives)
         self.device_timer.start()
         QTimer.singleShot(0, self.scan_devices)
+
+    def _start_thread(self, worker: Worker) -> None:
+        # keep a reference until the thread has really stopped; Qt aborts if a running QThread is collected
+        self._threads.add(worker)
+        worker.finished.connect(lambda: self._threads.discard(worker))
+        worker.start()
 
     # ---- construction
 
@@ -513,18 +522,35 @@ class MainWindow(QMainWindow):
 
     # ---- device handling
 
+    def _poll_drives(self):
+        """Rescans only when drives come or go; checking for the iPod itself can be slow."""
+        if drive_signature() != self._drive_sig:
+            self.scan_devices()
+
     def scan_devices(self):
-        if self.worker is not None:
+        """Looks for iPods on a background thread; the result lands in _apply_scan."""
+        if self.worker is not None or self.scanner is not None:
             return
-        roots = find_ipods()
+        self._drive_sig = drive_signature()
+        self.scanner = Worker(lambda _progress, _cancelled: [(r, volume_label(r)) for r in find_ipods()])
+        self.scanner.done.connect(self._apply_scan)
+        self.scanner.failed.connect(lambda _msg: setattr(self, "scanner", None))
+        self._start_thread(self.scanner)
+
+    def _apply_scan(self, found):
+        self.scanner = None
+        if self.worker is not None:
+            self._drive_sig = None  # a job started meanwhile; look again once it's done
+            return
+        roots = [r for r, _ in found]
         known = [self.device_combo.itemData(i) for i in range(self.device_combo.count())]
         if [str(r) for r in roots] == known:
             return
         current = str(self.ipod.root) if self.ipod else None
         self.device_combo.blockSignals(True)
         self.device_combo.clear()
-        for r in roots:
-            self.device_combo.addItem(f"{r}  ({_label_for(r)})", str(r))
+        for r, label in found:
+            self.device_combo.addItem(f"{r}  ({label})", str(r))
         self.device_combo.blockSignals(False)
         if current in [str(r) for r in roots]:
             self.device_combo.setCurrentIndex([str(r) for r in roots].index(current))
@@ -771,7 +797,7 @@ class MainWindow(QMainWindow):
         self.worker.progress.connect(progress)
         self.worker.done.connect(ok)
         self.worker.failed.connect(fail)
-        self.worker.start()
+        self._start_thread(self.worker)
 
     # ---- adding
 
@@ -988,11 +1014,6 @@ class MainWindow(QMainWindow):
         self.model.layoutChanged.emit()
         self.now_playing.clear()
         self.stop_btn.hide()
-
-
-def _label_for(root: Path) -> str:
-    from .device import volume_label
-    return volume_label(root)
 
 
 # --------------------------------------------------------------------------- styling / entry point

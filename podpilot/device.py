@@ -35,13 +35,39 @@ def app_data_dir() -> Path:
     return base / "PodPilot"
 
 
+_DRIVE_REMOVABLE = 2
+_DRIVE_FIXED = 3
+
+
+def drive_signature():
+    """Cheap fingerprint of the mounted volumes (no disk I/O), to know when to rescan."""
+    if os.name == "nt":
+        import ctypes
+        return ctypes.windll.kernel32.GetLogicalDrives()
+    found = []
+    user = os.environ.get("USER", "")
+    for base in (Path("/Volumes"), Path("/media") / user, Path("/run/media") / user, Path("/media"), Path("/mnt")):
+        try:
+            found.extend(sorted(os.listdir(base)))
+        except OSError:
+            pass
+    return tuple(found)
+
+
 def find_ipods() -> list[Path]:
-    """Mounted volumes that look like an iPod (have an iTunesDB)."""
+    """Mounted volumes that look like an iPod (have an iTunesDB).
+
+    Can block on slow volumes, so call it off the UI thread.
+    """
     candidates: list[Path] = []
     if os.name == "nt":
         import ctypes
-        mask = ctypes.windll.kernel32.GetLogicalDrives()
-        candidates = [Path(f"{letter}:\\") for i, letter in enumerate(string.ascii_uppercase) if mask >> i & 1]
+        kernel32 = ctypes.windll.kernel32
+        mask = kernel32.GetLogicalDrives()
+        for i, letter in enumerate(string.ascii_uppercase):
+            # iPods are local USB disks; skipping network/optical drives avoids long timeouts
+            if mask >> i & 1 and kernel32.GetDriveTypeW(f"{letter}:\\") in (_DRIVE_REMOVABLE, _DRIVE_FIXED):
+                candidates.append(Path(f"{letter}:\\"))
     else:
         user = os.environ.get("USER", "")
         for base in (Path("/Volumes"), Path("/media") / user, Path("/run/media") / user, Path("/media"), Path("/mnt")):
