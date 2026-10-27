@@ -306,6 +306,23 @@ class Track:
     def kind(self) -> str:
         return self.filetype_code.to_bytes(4, "big").decode("latin-1").strip()
 
+    @property
+    def has_artwork(self) -> bool:
+        # 0xA4 is 1 once a cover is in ArtworkDB, 2 when there isn't one (libgpod has_artwork).
+        return len(self.chunk.header) > 0xA4 and self.chunk.header[0xA4] == 1
+
+    def set_artwork_id(self, image_id: int, jpeg_size: int = 0) -> None:
+        """Points the track at an mhii image. `image_id` 0 clears it.
+
+        0x160 (mhii_link) is what classic and nano firmware use. It's only present
+        on mhit headers of 0x184 bytes or more; shorter headers match the mhii by dbid.
+        """
+        self.chunk.set("B", 0xA4, 1 if image_id else 2)
+        self.chunk.set("H", 0x7C, 1 if image_id else 0)
+        if jpeg_size:
+            self.chunk.set("I", 0x80, jpeg_size)
+        self.chunk.set("I", 0x160, image_id)
+
     def _string_mhod(self, mtype: int) -> Chunk | None:
         for c in self.chunk.children:
             if c.magic == b"mhod" and mhod_type(c) == mtype:

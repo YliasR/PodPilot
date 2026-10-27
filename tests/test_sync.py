@@ -25,6 +25,8 @@ def write_wav(path: Path, seconds: float) -> Path:
 @pytest.fixture
 def ipod(tmp_path, monkeypatch):
     monkeypatch.setattr(device, "app_data_dir", lambda: tmp_path / "appdata")
+    monkeypatch.setattr(device.artwork, "lookup_online",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("offline test hit the network")))
     root = tmp_path / "ipod"
     (root / "iPod_Control" / "iTunes").mkdir(parents=True)
     (root / "iPod_Control" / "Music" / "F00").mkdir(parents=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import json
 import os
 import random
@@ -17,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import hash58, media
+from . import artwork, hash58, ipodart, media
 from .itunesdb import ITunesDB, Track
 
 ProgressFn = Callable[[int, int, str], None]
@@ -155,6 +156,7 @@ class AddResult:
     added: list[Track] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    art: artwork.ArtResult | None = None
 
 
 @dataclass
@@ -178,6 +180,7 @@ class SyncResult:
     removed: int = 0
     cancelled: bool = False
     errors: list[str] = field(default_factory=list)
+    art: artwork.ArtResult | None = None
 
 
 @dataclass
@@ -197,6 +200,7 @@ class IPod:
         self.guid: bytes | None = None
         self.read_only_reason = self._check_signature(raw)
         self.play_counts_merged = self._merge_play_counts()
+        self._pending_covers: dict[int, bytes] = {}
 
     def _check_signature(self, raw: bytes) -> str | None:
         """Works out whether we can write this iPod's database. Returns why not, or None."""
@@ -396,6 +400,10 @@ class IPod:
             if progress:
                 progress(len(files), len(files), "Writing database")
             if result.added:
+                # A cancelled copy still keeps the songs already written. Art for those
+                # waits for the next fetch, same as a cancelled folder sync.
+                if not (cancelled and cancelled()):
+                    result.art = self.sync_artwork(progress, cancelled)
                 self.save()
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -405,11 +413,24 @@ class IPod:
         meta = meta or media.read_metadata(src)
         if skip_duplicates and self.find_duplicate(meta):
             return None
-        return self.db.add_track(self._upload(src, workdir, meta))
+        uploaded = self._upload(src, workdir, meta)
+        track = self.db.add_track(uploaded)
+        self._remember_cover(track, uploaded)
+        return track
+
+    def _remember_cover(self, track: Track, meta: dict) -> None:
+        cover = meta.pop("_cover", None)
+        if not cover:
+            return
+        self._pending_covers[track.dbid] = cover
+        # A replaced file may carry a different picture than the one already on the iPod.
+        if track.has_artwork:
+            track.set_artwork_id(0)
 
     def _upload(self, src: Path, workdir: Path, meta: dict) -> dict:
         """Converts `src` if needed and copies it into the music folders. Returns meta with location."""
         meta = dict(meta)
+        cover = artwork.local_cover(src)
         upload = src
         if media.needs_conversion(src, meta):
             upload = media.convert_to_mp3(src, workdir)
@@ -424,10 +445,194 @@ class IPod:
 
         dest = self._new_file_path(upload.suffix)
         shutil.copyfile(upload, dest)
+        jpeg = artwork.ensure_jpeg(cover) if cover else None
+        if jpeg and not artwork.embedded_cover(dest) and artwork.embed_cover(dest, jpeg):
+            size = dest.stat().st_size
         meta["size"] = size
         meta["filetype_code"] = media.NATIVE[upload.suffix.lower()]
         meta["location"] = self._location_of(dest)
+        if jpeg:
+            meta["_cover"] = jpeg
         return meta
+
+    def preview_cover(self, track: Track) -> bytes | None:
+        """Cover bytes already on hand for the song list. Never touches the network."""
+        pending = self._pending_covers.get(track.dbid)
+        if pending:
+            return pending
+        path = self.safe_path_of(track)
+        if path is not None and path.is_file():
+            found = artwork.embedded_cover(path)
+            if found:
+                return found
+        key = artwork.cache_key(track.artist, track.album, track.album_artist, track.title)
+        if key is None:
+            return None
+        return artwork.CoverCache(app_data_dir() / "artwork").get(key)
+
+    def artwork_pending(self) -> bool:
+        """True when opening the iPod should look for covers. Recent misses are skipped."""
+        cache = artwork.CoverCache(app_data_dir() / "artwork")
+        for track in self.db.tracks:
+            if track.has_artwork:
+                continue
+            key = artwork.cache_key(track.artist, track.album, track.album_artist, track.title)
+            if key is None or (cache.remembered_miss(key) and track.dbid not in self._pending_covers):
+                continue
+            return True
+        return False
+
+    def sync_artwork(self, progress: ProgressFn | None = None, cancelled: CancelFn | None = None,
+                     refresh: bool = False) -> artwork.ArtResult:
+        """Fills in covers for songs that don't have one yet, including ones already on the iPod.
+
+        Embedded art and pictures named cover.jpg / folder.jpg win. Otherwise the album
+        (or the song, if it has no album) is looked up online. The same picture is shared
+        by every song on that album. A song is only marked as having art once ArtworkDB
+        is safely on disk.
+        """
+        self.require_writable()
+        result = artwork.ArtResult()
+        cache = artwork.CoverCache(app_data_dir() / "artwork")
+        library = ipodart.ArtworkLibrary(self.control / "Artwork", device_dir=self.control / "Device")
+        try:
+            library.load()
+        except ipodart.ArtError as exc:
+            result.errors.append(str(exc))
+            library = None
+
+        groups: dict[str, list[Track]] = {}
+        order: list[str] = []
+        solos: list[Track] = []
+        for track in self.db.tracks:
+            if track.has_artwork:
+                result.already += 1
+                continue
+            if library is not None and track.dbid in library.dbids:
+                track.set_artwork_id(library.dbids[track.dbid])
+                result.updated += 1
+                self.db.mark_dirty()
+                continue
+            key = artwork.cache_key(track.artist, track.album, track.album_artist, track.title)
+            if key is None:
+                solos.append(track)
+            elif key not in groups:
+                order.append(key)
+                groups[key] = [track]
+            else:
+                groups[key].append(track)
+
+        work: list[tuple[str | None, list[Track]]] = [(key, groups[key]) for key in order]
+        work.extend((None, [track]) for track in solos)
+        linked: list[tuple[Track, int, int]] = []
+        offline = False
+        rendered: dict[bytes, list] = {}
+
+        def thumbs_for(jpeg: bytes) -> list:
+            if library is None:
+                return []
+            digest = hashlib.sha1(jpeg).digest()
+            if digest not in rendered:
+                built = []
+                for fmt in library.write_formats():
+                    thumb = artwork.render_thumb(jpeg, fmt)
+                    if thumb is not None:
+                        pixels, vpad, hpad = thumb
+                        built.append((fmt, pixels, vpad, hpad))
+                rendered[digest] = built
+            return rendered[digest]
+
+        for index, (key, tracks) in enumerate(work):
+            if cancelled and cancelled():
+                result.cancelled = True
+                break
+            label = tracks[0].album or tracks[0].title or "song"
+            if progress:
+                progress(index, len(work), f"Album art: {label}")
+            jpeg = self._cover_for(tracks, key, cache, refresh, result, offline_box := [offline])
+            offline = offline_box[0]
+            if not jpeg:
+                result.missing += len(tracks)
+                continue
+            if key and cache.get(key) != jpeg:
+                try:
+                    cache.store(key, jpeg)
+                except OSError as exc:
+                    result.errors.append(f"couldn't save the cover cache: {exc}")
+            built = thumbs_for(jpeg)
+            if library is not None and not built:
+                result.errors.append(f"{label}: cover couldn't be prepared for this iPod")
+            share = hashlib.sha1(jpeg).digest()
+            for track in tracks:
+                self._embed_on_device(track, jpeg, result)
+                if library is None or not built:
+                    continue
+                image_id = library.add_rendered(track.dbid, len(jpeg), built, share)
+                if image_id:
+                    linked.append((track, image_id, len(jpeg)))
+                else:
+                    result.errors.append(f"{track.title}: cover couldn't be stored")
+
+        if library is not None and library.dirty:
+            try:
+                library.save()
+            except (ipodart.ArtError, OSError) as exc:
+                result.errors.append(str(exc))
+                linked.clear()
+        for track, image_id, size in linked:
+            track.set_artwork_id(image_id, size)
+            result.updated += 1
+            self.db.mark_dirty()
+        return result
+
+    def _cover_for(self, tracks: list[Track], key: str | None, cache: artwork.CoverCache,
+                   refresh: bool, result: artwork.ArtResult, offline_box: list[bool]) -> bytes | None:
+        for track in tracks:
+            pending = self._pending_covers.get(track.dbid)
+            if pending:
+                return pending
+            path = self.safe_path_of(track)
+            if path is not None and path.is_file():
+                found = artwork.local_cover(path)
+                jpeg = artwork.ensure_jpeg(found) if found else None
+                if jpeg:
+                    return jpeg
+        if key is None or offline_box[0]:
+            return None
+        if not refresh:
+            cached = cache.get(key)
+            if cached:
+                return cached
+            if cache.remembered_miss(key):
+                return None
+        sample = tracks[0]
+        try:
+            raw = artwork.lookup_online(sample.album_artist or sample.artist, sample.album, sample.title)
+        except artwork.Offline as exc:
+            offline_box[0] = True
+            result.errors.append(f"Stopped looking online ({exc}). Covers already on the songs were still used.")
+            return None
+        jpeg = artwork.ensure_jpeg(raw) if raw else None
+        if jpeg is None and key is not None:
+            try:
+                cache.store_miss(key)
+            except OSError:
+                pass
+        return jpeg
+
+    def _embed_on_device(self, track: Track, jpeg: bytes, result: artwork.ArtResult) -> None:
+        path = self.safe_path_of(track)
+        if path is None or not path.is_file() or path.suffix.lower() not in (".mp3", ".m4a", ".m4b"):
+            return
+        if artwork.embedded_cover(path):
+            return
+        if not artwork.embed_cover(path, jpeg):
+            return
+        try:
+            track.size = path.stat().st_size
+            self.db.mark_dirty()
+        except OSError as exc:
+            result.errors.append(f"{track.title}: {exc}")
 
     # ---- folder sync
 
@@ -544,12 +749,16 @@ class IPod:
                     progress(i, len(work), str(src.relative_to(plan.folder)))
                 try:
                     if kind == "add":
-                        track = self.db.add_track(self._upload(src, workdir, item[1]))
+                        uploaded = self._upload(src, workdir, item[1])
+                        track = self.db.add_track(uploaded)
+                        self._remember_cover(track, uploaded)
                         result.added += 1
                     else:
                         track, meta = item[1], item[2]
                         old = self.safe_path_of(track)
-                        self.db.apply_meta(track, self._upload(src, workdir, meta))
+                        uploaded = self._upload(src, workdir, meta)
+                        self.db.apply_meta(track, uploaded)
+                        self._remember_cover(track, uploaded)
                         if old is not None:
                             replaced.append(old)  # deleted only once the new database is saved
                         result.updated += 1
@@ -558,6 +767,8 @@ class IPod:
                     result.errors.append(f"{src.name}: {exc}")
             if progress:
                 progress(len(work), len(work), "Writing database")
+            if not result.cancelled and (result.added or result.updated or self._pending_covers):
+                result.art = self.sync_artwork(progress, cancelled)
             self.save()
             manifest["folder"] = str(plan.folder)
             self.save_manifest(manifest)
@@ -663,10 +874,12 @@ class IPod:
                     raise media.MediaError(f"{f.name}: format not playable on the iPod")
                 meta["filetype_code"] = media.NATIVE[f.suffix.lower()]
                 meta["location"] = self._location_of(f)
-                result.added.append(self.db.add_track(meta))
+                track = self.db.add_track(meta)
+                result.added.append(track)
             except media.MediaError as exc:
                 result.errors.append(str(exc))
         if result.added:
+            result.art = self.sync_artwork()
             self.save()
         return result
 

@@ -49,6 +49,20 @@ def fmt_date(mac_ts: int) -> str:
     return dt.strftime("%Y-%m-%d") if dt else ""
 
 
+def describe_art(art) -> tuple[list[str], list[str]]:
+    """Lines for a result dialog, and the errors that belong in the details."""
+    if art is None:
+        return [], []
+    lines = []
+    if art.updated:
+        lines.append(f"Album art added for {art.updated} song(s).")
+    if art.missing:
+        lines.append(f"No cover found for {art.missing} song(s).")
+    if art.cancelled:
+        lines.append("Album art lookup was cancelled.")
+    return lines, list(art.errors)
+
+
 def app_icon() -> QIcon:
     return QIcon(icon_pixmap(64))
 
@@ -473,6 +487,9 @@ class MainWindow(QMainWindow):
         self.device_timer.start()
         QTimer.singleShot(0, self.scan_devices)
         self.settings = QSettings("PodPilot", "PodPilot")
+        self.act_auto_art.blockSignals(True)
+        self.act_auto_art.setChecked(self.settings.value("artwork/auto_fetch", True, type=bool))
+        self.act_auto_art.blockSignals(False)
         self._restore_columns()
         self.pending_release: updater.Release | None = None
         QTimer.singleShot(1500, self.auto_check_updates)
@@ -541,6 +558,11 @@ class MainWindow(QMainWindow):
         tb.addWidget(spacer)
 
         menu = QMenu(self)
+        self.act_fetch_art = menu.addAction("Fetch Album Art", lambda: self.fetch_artwork(False))
+        self.act_auto_art = menu.addAction("Fetch Album Art Automatically")
+        self.act_auto_art.setCheckable(True)
+        self.act_auto_art.toggled.connect(lambda on: self.settings.setValue("artwork/auto_fetch", on))
+        menu.addSeparator()
         menu.addAction("Check for Updates…", self.check_updates)
         self.act_auto_update = menu.addAction("Check for Updates Automatically")
         self.act_auto_update.setCheckable(True)
@@ -675,6 +697,20 @@ class MainWindow(QMainWindow):
         self.search.setClearButtonEnabled(True)
         rl.addWidget(self.search)
 
+        self.cover_row = QWidget()
+        cover_lay = QHBoxLayout(self.cover_row)
+        cover_lay.setContentsMargins(0, 0, 0, 6)
+        self.cover_pix = QLabel()
+        self.cover_pix.setFixedSize(64, 64)
+        self.cover_pix.setAlignment(Qt.AlignCenter)
+        self.cover_pix.setStyleSheet("background: #1c1e24; border-radius: 4px;")
+        self.cover_text = QLabel()
+        self.cover_text.setWordWrap(True)
+        cover_lay.addWidget(self.cover_pix)
+        cover_lay.addWidget(self.cover_text, 1)
+        self.cover_row.hide()
+        rl.addWidget(self.cover_row)
+
         self.model = TrackModel()
         self.proxy = TrackFilter()
         self.proxy.setSourceModel(self.model)
@@ -804,6 +840,8 @@ class MainWindow(QMainWindow):
         self.refresh_view()
         if self.ipod.play_counts_merged:
             self.statusBar().showMessage("Merged play counts recorded on the iPod since the last sync.", 6000)
+        # After this function returns, so a caller can finish its own refresh first.
+        QTimer.singleShot(0, self._maybe_fetch_artwork)
 
     def close_device(self):
         self.stop_preview()
@@ -921,7 +959,7 @@ class MainWindow(QMainWindow):
         in_playlist = self._current_playlist() is not None
         for a in (self.act_health, self.act_eject, self.act_refresh):
             a.setEnabled(has_dev)
-        for a in (self.act_add, self.act_add_folder, self.act_sync):
+        for a in (self.act_add, self.act_add_folder, self.act_sync, self.act_fetch_art):
             a.setEnabled(can_write)
         self.act_export.setEnabled(has_sel)
         for a in (self.act_remove, self.act_edit, self.act_playlist):
@@ -930,6 +968,49 @@ class MainWindow(QMainWindow):
         self.act_remove.setText("Remove from Playlist" if in_playlist else "Delete")
         self.act_remove.setToolTip("Remove the selected songs from this playlist (they stay on the iPod)"
                                    if in_playlist else "Delete the selected songs from the iPod")
+        self._update_cover()
+
+    def _update_cover(self):
+        """Small cover for the one selected song, from the file or the disk cache. No network."""
+        track = None
+        if self.ipod is not None:
+            chosen = self.selected_tracks()
+            if len(chosen) == 1:
+                track = chosen[0]
+        jpeg = self.ipod.preview_cover(track) if track is not None else None
+        pix = QPixmap()
+        if not jpeg or not pix.loadFromData(jpeg):
+            self.cover_row.hide()
+            return
+        self.cover_pix.setPixmap(pix.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        who = " · ".join(part for part in (track.artist, track.album) if part)
+        self.cover_text.setText(track.title + (f"\n{who}" if who else ""))
+        self.cover_row.show()
+
+    def _maybe_fetch_artwork(self):
+        if (self.ipod and self.ipod.writable and self.worker is None and self.act_auto_art.isChecked()
+                and self.ipod.artwork_pending()):
+            self.fetch_artwork(True)
+
+    def fetch_artwork(self, automatic: bool = False):
+        if not self.ipod or self.worker or not self.ipod.writable:
+            return
+        ipod = self.ipod
+
+        def done(result):
+            lines, errors = describe_art(result)
+            if automatic and not result.updated and not errors and not result.cancelled:
+                if result.missing:
+                    self.statusBar().showMessage(f"No cover found for {result.missing} song(s).", 6000)
+                return
+            text = "\n".join(lines) or "Album art is up to date."
+            box = QMessageBox(QMessageBox.Warning if errors else QMessageBox.Information,
+                              "Album Art", text, parent=self)
+            if errors:
+                box.setDetailedText("\n".join(errors))
+            box.exec()
+
+        self.run_job("Fetching album art", lambda progress, cancelled: ipod.sync_artwork(progress, cancelled), done)
 
     # ---- context menus
 
@@ -1054,10 +1135,12 @@ class MainWindow(QMainWindow):
                 lines.append(f"Skipped {len(result.skipped)} already on the iPod.")
             if result.errors:
                 lines.append(f"{len(result.errors)} file(s) failed.")
-            box = QMessageBox(QMessageBox.Warning if result.errors else QMessageBox.Information,
+            art_lines, art_errors = describe_art(result.art)
+            lines.extend(art_lines)
+            box = QMessageBox(QMessageBox.Warning if result.errors or art_errors else QMessageBox.Information,
                               "PodPilot", "\n".join(lines), parent=self)
-            if result.errors or result.skipped:
-                details = result.errors + [f"Already on iPod: {s}" for s in result.skipped]
+            details = list(result.errors) + art_errors + [f"Already on iPod: {s}" for s in result.skipped]
+            if details:
                 box.setDetailedText("\n".join(details))
             box.exec()
 
@@ -1094,11 +1177,15 @@ class MainWindow(QMainWindow):
             text = ", ".join(parts)
             if result.cancelled:
                 text += "\n\nThe sync was cancelled partway; run it again to finish."
-            box = QMessageBox(QMessageBox.Warning if result.errors else QMessageBox.Information,
+            art_lines, art_errors = describe_art(result.art)
+            if art_lines:
+                text += "\n" + "\n".join(art_lines)
+            box = QMessageBox(QMessageBox.Warning if result.errors or art_errors else QMessageBox.Information,
                               "Sync from Folder", text, parent=self)
-            if result.errors:
-                box.setInformativeText(f"{len(result.errors)} file(s) had problems.")
-                box.setDetailedText("\n".join(result.errors))
+            details = list(result.errors) + art_errors
+            if details:
+                box.setInformativeText(f"{len(details)} file(s) had problems.")
+                box.setDetailedText("\n".join(details))
             box.exec()
 
         self.run_job("Scanning the folder", lambda p, c: ipod.plan_sync(Path(folder), p, c), planned)
@@ -1237,7 +1324,7 @@ class MainWindow(QMainWindow):
                 return
             if dlg.choice == "import":
                 self.run_job("Adding files to the library", lambda p, c: ipod.import_orphans(report.orphan_files),
-                             lambda r: QMessageBox.information(self, "PodPilot", f"Added {len(r.added)} song(s)."))
+                             self._orphans_added)
             elif dlg.choice == "delete":
                 if QMessageBox.question(self, "Delete files", f"Permanently delete {len(report.orphan_files)} "
                                         "file(s) from the iPod?") == QMessageBox.Yes:
@@ -1246,6 +1333,17 @@ class MainWindow(QMainWindow):
                 self.run_job("Cleaning up", lambda p, c: ipod.drop_missing(report.missing_tracks), lambda r: None)
 
         self.run_job("Checking the library", lambda p, c: ipod.health(), done)
+
+    def _orphans_added(self, result):
+        lines = [f"Added {len(result.added)} song(s)."]
+        art_lines, art_errors = describe_art(result.art)
+        lines.extend(art_lines)
+        box = QMessageBox(QMessageBox.Warning if result.errors or art_errors else QMessageBox.Information,
+                          "PodPilot", "\n".join(lines), parent=self)
+        details = list(result.errors) + art_errors
+        if details:
+            box.setDetailedText("\n".join(details))
+        box.exec()
 
     # ---- updates
 
