@@ -311,6 +311,11 @@ class Track:
         # 0xA4 is 1 once a cover is in ArtworkDB, 2 when there isn't one (libgpod has_artwork).
         return len(self.chunk.header) > 0xA4 and self.chunk.header[0xA4] == 1
 
+    @property
+    def artwork_id(self) -> int:
+        """mhii_link. 0 when unset or the mhit header is too short to hold it."""
+        return self.chunk.get("I", 0x160)
+
     def set_artwork_id(self, image_id: int, jpeg_size: int = 0) -> None:
         """Points the track at an mhii image. `image_id` 0 clears it.
 

@@ -50,6 +50,8 @@ def write_wav(path: Path, seconds: float = 1) -> Path:
 @pytest.fixture
 def ipod(tmp_path, monkeypatch):
     monkeypatch.setattr(device, "app_data_dir", lambda: tmp_path / "appdata")
+    monkeypatch.setattr(device, "_guid_from_os", lambda root: None)
+    monkeypatch.setattr(device, "_usb_product_id", lambda root, guid: None)
     root = tmp_path / "ipod"
     (root / "iPod_Control" / "iTunes").mkdir(parents=True)
     (root / "iPod_Control" / "Music" / "F00").mkdir(parents=True)
@@ -122,6 +124,36 @@ def test_artworkdb_create_append_and_share_pixels(tmp_path):
     assert reloaded.dbids[0xABC] == first
     assert reloaded.dbids[0x111] == third
     assert (folder / "ArtworkDB.podpilot-bak").is_file()
+
+
+def test_usb_product_picks_the_model_formats():
+    assert [f.format_id for f in ipodart.formats_for_usb_product(0x1260)] == [1027, 1031]
+    assert ipodart.formats_for_usb_product(0x9999) == []
+    assert ipodart.formats_for_usb_product(None) == []
+
+
+def test_formats_the_model_doesnt_use_are_dropped(tmp_path):
+    folder = tmp_path / "Artwork"
+    nano = ThumbFormat(1027, 2, 2)
+    big = ThumbFormat(1060, 2, 2)
+    pixels = bytes(nano.pixel_bytes)
+    lib = ArtworkLibrary(folder, formats=[nano, big])
+    lib.load()
+    kept = lib.add_rendered(0xA, 10, [(nano, pixels, 0, 0), (big, pixels, 0, 0)])
+    lib.add_rendered(0xB, 10, [(big, pixels, 0, 0)])
+    lib.save()
+
+    model = ipodart.formats_for_usb_product(0x1260)
+    fixed = ArtworkLibrary(folder, model_formats=model)
+    fixed.load()
+    assert fixed.drop_unused_formats()
+    fixed.save()
+    reloaded = ArtworkLibrary(folder, model_formats=model)
+    reloaded.load()
+    assert reloaded.existing_format_ids == [1027]
+    assert reloaded.dbids == {0xA: kept}
+    assert int.from_bytes(reloaded.records[0][0x0C:0x10], "little") == 1
+    assert not reloaded.drop_unused_formats()
 
 
 def test_bad_artworkdb_is_left_alone(tmp_path):
@@ -245,3 +277,19 @@ def test_unreadable_artworkdb_does_not_fail_the_import(ipod, qapp, monkeypatch, 
     assert not result.added[0].has_artwork
     assert result.art is not None and result.art.errors
     assert (folder / "ArtworkDB").read_bytes() == b"garbage-not-mhfd"
+
+
+def test_flag_without_an_image_is_fetched_again(ipod, qapp, monkeypatch, tmp_path):
+    jpeg = tiny_jpeg()
+    monkeypatch.setattr(artwork, "lookup_online", lambda *a, **k: jpeg)
+    write_wav(tmp_path / "a" / "One.wav")
+    ipod.add_files([tmp_path / "a" / "One.wav"])
+    track = ipod.db.tracks[0]
+    track.artist = "Radiohead"
+    track.album = "OK Computer"
+    track.set_artwork_id(500)  # left by iTunes; ArtworkDB no longer has it
+    assert ipod.artwork_pending()
+    art = ipod.sync_artwork()
+    assert art.updated == 1 and art.already == 0
+    assert track.has_artwork and track.artwork_id not in (0, 500)
+    assert not ipod.artwork_pending()

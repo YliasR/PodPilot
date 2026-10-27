@@ -61,6 +61,21 @@ FALLBACK_FORMATS = (
 )
 _FORMATS_BY_ID = {f.format_id: f for f in FALLBACK_FORMATS}
 
+# Cover formats per model, keyed by USB product id (libgpod's per-model tables).
+# Used when SysInfoExtended is missing, which is the usual case on Windows.
+USB_PRODUCT_FORMATS = {
+    0x120A: (1027, 1031),              # nano 1G
+    0x1260: (1027, 1031),              # nano 2G
+    0x1209: (1028, 1029),              # video 5G/5.5G
+    0x1261: (1061, 1055, 1068, 1060),  # classic 6G-7G
+    0x1262: (1061, 1055, 1068, 1060),  # nano 3G
+}
+
+
+def formats_for_usb_product(product_id: int | None) -> list[ThumbFormat]:
+    """Cover formats for a USB product id. Empty if the model isn't known."""
+    return [_FORMATS_BY_ID[fid] for fid in USB_PRODUCT_FORMATS.get(product_id or 0, ())]
+
 _MHFD = 0x84
 _MHSD = 0x60
 _LIST = 0x5C
@@ -144,9 +159,19 @@ def formats_from_sysinfo(device_dir: Path | None) -> list[ThumbFormat]:
     return out
 
 
-def resolve_formats(device_dir: Path | None, existing_ids: list[int]) -> list[ThumbFormat]:
-    """Formats to write. An existing ArtworkDB wins, so we append to its files."""
+def resolve_formats(device_dir: Path | None, existing_ids: list[int],
+                    model_formats: list[ThumbFormat] | None = None) -> list[ThumbFormat]:
+    """Formats to write.
+
+    What the device says about itself (SysInfoExtended, else its USB model) wins as long
+    as it shares a format with an existing ArtworkDB. Otherwise the existing ArtworkDB
+    wins, so we append to its files.
+    """
     described = {f.format_id: f for f in formats_from_sysinfo(device_dir)}
+    if not described and model_formats:
+        described = {f.format_id: f for f in model_formats}
+    if described and (not existing_ids or set(existing_ids) & set(described)):
+        return list(described.values())
     if existing_ids:
         out = []
         for fid in existing_ids:
@@ -154,8 +179,6 @@ def resolve_formats(device_dir: Path | None, existing_ids: list[int]) -> list[Th
             if fmt is not None:
                 out.append(fmt)
         return out
-    if described:
-        return list(described.values())
     return list(FALLBACK_FORMATS)
 
 
@@ -232,15 +255,38 @@ def _take(data: bytes, offset: int) -> tuple[bytes, int]:
     return data[offset:offset + total], offset + total
 
 
+def _strip_thumbs(rec: bytes, keep: set[int]) -> bytes | None:
+    """An mhii without thumbnails outside `keep`. None if no thumbnail is left."""
+    header_len = _u32(rec, 4)
+    kids = []
+    thumbs = 0
+    pos = header_len
+    while pos < len(rec):
+        kid, pos = _take(rec, pos)
+        if kid[:4] == b"mhod" and _u16(kid, 0x0C) == 2:
+            mhni = kid[_u32(kid, 4):]
+            if mhni[:4] == b"mhni" and len(mhni) >= 0x14 and _u32(mhni, 0x10) not in keep:
+                continue
+            thumbs += 1
+        kids.append(kid)
+    if not thumbs:
+        return None
+    header = bytearray(rec[:header_len])
+    body = b"".join(kids)
+    struct.pack_into("<II", header, 8, header_len + len(body), len(kids))
+    return bytes(header) + body
+
+
 class ArtworkLibrary:
     """The Artwork folder. Load, append covers, save. Existing records stay byte-for-byte."""
 
     def __init__(self, folder: Path, formats: list[ThumbFormat] | None = None,
-                 device_dir: Path | None = None):
+                 device_dir: Path | None = None, model_formats: list[ThumbFormat] | None = None):
         self.folder = Path(folder)
         self.path = self.folder / "ArtworkDB"
         self.formats = formats
         self.device_dir = device_dir
+        self.model_formats = model_formats
         self.mhfd_header: bytes | None = None
         self.records: list[bytes] = []
         self.dbids: dict[int, int] = {}
@@ -329,7 +375,34 @@ class ArtworkLibrary:
     def write_formats(self) -> list[ThumbFormat]:
         if self.formats is not None:
             return self.formats
-        return resolve_formats(self.device_dir, self.existing_format_ids)
+        return resolve_formats(self.device_dir, self.existing_format_ids, self.model_formats)
+
+    def drop_unused_formats(self) -> bool:
+        """Removes thumbnails in formats this iPod doesn't use. True if anything changed.
+
+        PodPilot 0.4.0 wrote every known format when it couldn't tell the model, and
+        firmware given those extra formats shows no art. Only formats outside the
+        resolved set are dropped; the .ithmb files are left as they are.
+        """
+        keep = {f.format_id for f in formats_from_sysinfo(self.device_dir) or self.model_formats or ()}
+        existing = set(self.existing_format_ids)
+        if not keep or not existing & keep or existing <= keep:
+            return False
+        records = []
+        for rec in self.records:
+            stripped = _strip_thumbs(rec, keep)
+            if stripped is not None:
+                records.append(stripped)
+        self.records = records
+        self.dbids = {}
+        for rec in records:
+            dbid = _u64(rec, 0x14)
+            if dbid:
+                self.dbids.setdefault(dbid, _u32(rec, 0x10))
+        self.mhifs = [m for m in self.mhifs if _u32(m, 0x10) in keep]
+        self.existing_format_ids = [fid for fid in self.existing_format_ids if fid in keep]
+        self.dirty = True
+        return True
 
     def _stage(self, format_id: int, pixels: bytes) -> int:
         if format_id not in self._base_size:
@@ -374,11 +447,11 @@ class ArtworkLibrary:
         if not self.dirty:
             return
         formats = {f.format_id: f for f in self.write_formats()}
-        mhifs = self.mhifs
+        have = {_u32(m, 0x10) for m in self.mhifs}
+        mhifs = self.mhifs + [_mhif(formats[fid]) for fid in self._appends
+                              if fid in formats and fid not in have]
         if not mhifs:
-            mhifs = [_mhif(formats[fid]) for fid in self._appends if fid in formats]
-            if not mhifs:
-                raise ArtError("This iPod's cover formats aren't ones PodPilot can write, so on-device art was skipped.")
+            raise ArtError("This iPod's cover formats aren't ones PodPilot can write, so on-device art was skipped.")
         images = _mhsd(1, _list(b"mhli", len(self.records), b"".join(self.records)))
         albums = self.album_section if self.album_section is not None else _mhsd(2, _list(b"mhla", 0, b""))
         files = _mhsd(3, _list(b"mhlf", len(mhifs), b"".join(mhifs)))

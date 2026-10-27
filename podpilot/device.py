@@ -143,6 +143,38 @@ def _guid_from_os(root: Path) -> str | None:
     return match.group(1) if match else None
 
 
+def _usb_product_id(root: Path, guid: str | None) -> int | None:
+    """USB product id of the iPod mounted at `root`, which identifies the model."""
+    try:
+        if os.name == "nt":
+            if not guid:
+                return None
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Enum\USB") as usb:
+                for i in range(winreg.QueryInfoKey(usb)[0]):
+                    name = winreg.EnumKey(usb, i)
+                    match = re.fullmatch(r"VID_05AC&PID_([0-9A-Fa-f]{4})", name)
+                    if not match:
+                        continue
+                    try:
+                        winreg.OpenKey(usb, f"{name}\\{guid}").Close()
+                    except OSError:
+                        continue
+                    return int(match.group(1), 16)
+        elif sys.platform.startswith("linux"):
+            with open("/proc/mounts") as fh:
+                dev = next((line.split()[0] for line in fh if Path(line.split()[1]) == root), "")
+            node = (Path("/sys/class/block") / Path(dev).name).resolve()
+            while node != node.parent:
+                product = node / "idProduct"
+                if product.is_file():
+                    return int(product.read_text().strip(), 16)
+                node = node.parent
+    except (OSError, ValueError, StopIteration):
+        pass
+    return None
+
+
 class UnsafeLocation(Exception):
     """A track location that points outside the iPod's music folder."""
 
@@ -201,6 +233,7 @@ class IPod:
         self.read_only_reason = self._check_signature(raw)
         self.play_counts_merged = self._merge_play_counts()
         self._pending_covers: dict[int, bytes] = {}
+        self._model_art_formats: list[ipodart.ThumbFormat] | None = None
 
     def _check_signature(self, raw: bytes) -> str | None:
         """Works out whether we can write this iPod's database. Returns why not, or None."""
@@ -473,14 +506,34 @@ class IPod:
     def artwork_pending(self) -> bool:
         """True when opening the iPod should look for covers. Recent misses are skipped."""
         cache = artwork.CoverCache(app_data_dir() / "artwork")
+        library = ipodart.ArtworkLibrary(self.control / "Artwork")
+        try:
+            library.load()
+            images = library.dbids
+        except ipodart.ArtError:
+            images = None
         for track in self.db.tracks:
-            if track.has_artwork:
+            if images is not None and track.dbid in images:
+                if track.has_artwork:
+                    continue
+                return True
+            if track.has_artwork and images is None:
                 continue
             key = artwork.cache_key(track.artist, track.album, track.album_artist, track.title)
             if key is None or (cache.remembered_miss(key) and track.dbid not in self._pending_covers):
                 continue
             return True
         return False
+
+    def _artwork_library(self) -> ipodart.ArtworkLibrary:
+        device_dir = self.control / "Device"
+        if self._model_art_formats is None:
+            self._model_art_formats = []
+            if not ipodart.formats_from_sysinfo(device_dir):
+                guid = _guid_from_sysinfo(device_dir) or _guid_from_os(self.root)
+                self._model_art_formats = ipodart.formats_for_usb_product(_usb_product_id(self.root, guid))
+        return ipodart.ArtworkLibrary(self.control / "Artwork", device_dir=device_dir,
+                                      model_formats=self._model_art_formats)
 
     def sync_artwork(self, progress: ProgressFn | None = None, cancelled: CancelFn | None = None,
                      refresh: bool = False) -> artwork.ArtResult:
@@ -494,9 +547,10 @@ class IPod:
         self.require_writable()
         result = artwork.ArtResult()
         cache = artwork.CoverCache(app_data_dir() / "artwork")
-        library = ipodart.ArtworkLibrary(self.control / "Artwork", device_dir=self.control / "Device")
+        library = self._artwork_library()
         try:
             library.load()
+            library.drop_unused_formats()
         except ipodart.ArtError as exc:
             result.errors.append(str(exc))
             library = None
@@ -505,13 +559,18 @@ class IPod:
         order: list[str] = []
         solos: list[Track] = []
         for track in self.db.tracks:
-            if track.has_artwork:
-                result.already += 1
-                continue
             if library is not None and track.dbid in library.dbids:
-                track.set_artwork_id(library.dbids[track.dbid])
-                result.updated += 1
-                self.db.mark_dirty()
+                image_id = library.dbids[track.dbid]
+                if track.has_artwork and track.artwork_id in (0, image_id):
+                    result.already += 1
+                else:
+                    track.set_artwork_id(image_id)
+                    result.updated += 1
+                    self.db.mark_dirty()
+                continue
+            # A flag iTunes left for an image that is no longer in ArtworkDB means no art.
+            if track.has_artwork and library is None:
+                result.already += 1
                 continue
             key = artwork.cache_key(track.artist, track.album, track.album_artist, track.title)
             if key is None:
